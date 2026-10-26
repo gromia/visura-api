@@ -81,8 +81,22 @@ async def login(page: Page):
         raise Exception("Utente già in sessione su un'altra postazione")
 
     try:
-        print("[LOGIN] Clicco 'Conferma'...")
-        await page.get_by_role("button", name="Conferma").click()
+        # Chi ha una convenzione sceglie il profilo con "Conferma"; senza, SISTER apre "Adesione ai servizi":
+        # si prova la voce "Consultazioni" e i log riportano cosa compare
+        confirm = page.get_by_role("button", name="Conferma")
+        try:
+            await confirm.wait_for(state="visible", timeout=10000)
+            print("[LOGIN] Clicco 'Conferma'...")
+            await confirm.click()
+        except PlaywrightTimeoutError:
+            await dump_page(page, "SISTER senza 'Conferma'")
+            print("[LOGIN] Nessun 'Conferma': provo 'Consultazioni'...")
+            await page.get_by_role("link", name="Consultazioni", exact=True).first.click(timeout=15000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=30000)
+            except PlaywrightTimeoutError:
+                pass
+            await dump_page(page, "dopo 'Consultazioni'")
         print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
         await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
         print("[LOGIN] Clicco 'Visure catastali'...")
