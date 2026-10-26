@@ -54,14 +54,19 @@ async def login(page: Page):
             content = await page.content()
             print("[LOGIN][DEBUG] HTML pagina:\n" + content)
             print("[LOGIN] Continuo comunque.")
-    print("[LOGIN] Clicco 'Autorizza'...")
-    await page.get_by_role("button", name="Autorizza").click()
-    print("[LOGIN] Cerco servizio SISTER...")
-    await page.get_by_role("textbox", name="Cerca il servizio").click()
-    await page.get_by_role("textbox", name="Cerca il servizio").fill("SISTER")
-    await page.get_by_role("textbox", name="Cerca il servizio").press("Enter")
-    print("[LOGIN] Clicco 'Vai al servizio'...")
-    await page.get_by_role("link", name="Vai al servizio").first.click()
+    # Il pulsante "Autorizza" compare solo dopo l'approvazione sull'app MySielteID: 90 secondi per farlo
+    print("[LOGIN] Attendo l'approvazione su MySielteID e clicco 'Autorizza'...")
+    await page.get_by_role("button", name="Autorizza").click(timeout=90000)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=60000)
+    except PlaywrightTimeoutError:
+        pass
+    await dump_page(page, "dopo Autorizza")
+    try:
+        await open_sister(page)
+    except Exception:
+        await dump_page(page, "apertura SISTER non riuscita")
+        raise
 
     print("[LOGIN] Attendo caricamento pagina...")
     await page.wait_for_load_state("networkidle")
@@ -75,14 +80,58 @@ async def login(page: Page):
         print("[LOGIN][ERRORE] Utente già in sessione su un'altra postazione!")
         raise Exception("Utente già in sessione su un'altra postazione")
 
-    print("[LOGIN] Clicco 'Conferma'...")
-    await page.get_by_role("button", name="Conferma").click()
-    print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
-    await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
-    print("[LOGIN] Clicco 'Visure catastali'...")
-    await page.get_by_role("link", name="Visure catastali").click()
-    print("[LOGIN] Clicco 'Conferma Lettura'...")
-    await page.get_by_role("link", name="Conferma Lettura").click()
+    try:
+        print("[LOGIN] Clicco 'Conferma'...")
+        await page.get_by_role("button", name="Conferma").click()
+        print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
+        await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
+        print("[LOGIN] Clicco 'Visure catastali'...")
+        await page.get_by_role("link", name="Visure catastali").click()
+        print("[LOGIN] Clicco 'Conferma Lettura'...")
+        await page.get_by_role("link", name="Conferma Lettura").click()
+    except Exception:
+        await dump_page(page, "menu SISTER non riuscito")
+        raise
+    print("[LOGIN] Login completato, SISTER pronto.")
+
+
+async def dump_page(page: Page, tag: str):
+    """Scrive nei log cosa c'è nella pagina (indirizzo, titolo, link, pulsanti, campi, testo) per capire dove si è fermato il login."""
+    try:
+        info = await page.evaluate("""() => {
+            const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+            const txt = e => (e.innerText || e.value || e.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim().slice(0, 80);
+            return {
+                links: [...document.querySelectorAll('a')].filter(vis).slice(0, 80).map(a => txt(a) + ' -> ' + (a.getAttribute('href') || '')),
+                buttons: [...document.querySelectorAll('button, input[type=submit], input[type=button]')].filter(vis).slice(0, 40).map(txt),
+                inputs: [...document.querySelectorAll('input:not([type=hidden]), textarea')].filter(vis).slice(0, 30)
+                    .map(i => [i.type, i.name, i.id, i.placeholder, i.getAttribute('aria-label')].filter(Boolean).join(' | ')),
+                text: (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').slice(0, 1500),
+            };
+        }""")
+        print(f"[LOGIN][PAGINA] {tag}: url={page.url} titolo={await page.title()!r} schede={len(page.context.pages)}")
+        for k in ("links", "buttons", "inputs"):
+            for v in info[k]:
+                print(f"[LOGIN][PAGINA]   {k}: {v}")
+        print(f"[LOGIN][PAGINA]   testo: {info['text']}")
+    except Exception as e:
+        print(f"[LOGIN][PAGINA] {tag}: impossibile leggere la pagina ({e})")
+
+
+async def open_sister(page: Page):
+    """Dall'area riservata dell'Agenzia delle Entrate apre SISTER: prima con la ricerca dei servizi, poi con un link che porta a SISTER."""
+    search = page.get_by_role("textbox", name=re.compile("cerca", re.I)).or_(page.locator("input[type=search]")).first
+    try:
+        await search.wait_for(state="visible", timeout=15000)
+        print("[LOGIN] Cerco servizio SISTER...")
+        await search.fill("SISTER")
+        await search.press("Enter")
+        await page.get_by_role("link", name=re.compile("vai al servizio", re.I)).first.click(timeout=20000)
+        return
+    except PlaywrightTimeoutError:
+        print("[LOGIN] Ricerca dei servizi non trovata, cerco un link a SISTER...")
+    link = page.locator("a[href*='sister' i]").or_(page.get_by_role("link", name=re.compile("sister", re.I))).first
+    await link.click(timeout=15000)
 
 async def find_best_option_match(page, selector, search_text):
     """Trova l'opzione che meglio corrisponde al testo cercato"""
