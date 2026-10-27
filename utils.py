@@ -1320,3 +1320,60 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
     }
     
     return result
+
+
+async def dump_form(page: Page, tag: str):
+    """Scrive nei log link, campi, menu a tendina (con le prime voci) e pulsanti della pagina: serve a costruire nuove ricerche."""
+    info = await page.evaluate("""() => {
+        const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+        const txt = e => (e.innerText || e.value || '').replace(/\\s+/g, ' ').trim().slice(0, 60);
+        const lab = e => { const l = e.id && document.querySelector('label[for="' + e.id + '"]'); return l ? txt(l) : ''; };
+        return {
+            links: [...document.querySelectorAll('a')].filter(vis).map(a => txt(a) + ' -> ' + (a.getAttribute('href') || '')).slice(0, 60),
+            fields: [...document.querySelectorAll('input, select, textarea')].filter(e => e.type !== 'hidden' ? vis(e) : true).map(e =>
+                [e.tagName, 'type=' + (e.type || ''), 'name=' + (e.name || ''), 'id=' + (e.id || ''), 'value=' + String(e.value || '').slice(0, 40),
+                 'label=' + lab(e), e.checked ? 'checked' : '',
+                 e.tagName === 'SELECT' ? 'opzioni(' + e.options.length + ')=' + [...e.options].slice(0, 12).map(o => o.value + ':' + o.text.trim()).join(' | ') : ''
+                ].filter(Boolean).join(' ')),
+            text: (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').slice(0, 1200),
+        };
+    }""")
+    print(f"[ESPLORA] {tag}: url={page.url} titolo={await page.title()!r}")
+    for k in ("links", "fields"):
+        for v in info[k]:
+            print(f"[ESPLORA]   {k}: {v}")
+    print(f"[ESPLORA]   testo: {info['text']}")
+
+
+async def explore_sister(page: Page, provincia: str):
+    """Ricognizione dei moduli di ricerca di SISTER per una provincia: apre ogni voce del menu di consultazione
+    (Immobile, Soggetto, Indirizzo...) e ne scrive i campi nei log, senza mai lanciare una ricerca."""
+    scelta = "https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_"
+    await page.goto(scelta, timeout=60000)
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    value = await find_best_option_match(page, "select[name='listacom']", provincia if provincia != "1" else "MILANO")
+    await page.locator("select[name='listacom']").select_option(value)
+    await page.locator("input[type='submit'][value='Applica']").click()
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    await dump_form(page, "menu dopo Applica")
+    menu = page.url
+    names = [n for n in await page.locator("a").all_inner_texts() if n.strip()]
+    for name in [n.strip() for n in names if re.search(r"soggett|persona|indirizz|partita|giuridic|fisic|immobil", n, re.I)]:
+        try:
+            await page.goto(menu, timeout=60000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.get_by_role("link", name=name, exact=True).first.click(timeout=15000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
+            await dump_form(page, f"modulo '{name}'")
+            # un livello in più: "Soggetto" può chiedere prima persona fisica o giuridica
+            sub_url = page.url
+            subs = [n.strip() for n in await page.locator("a").all_inner_texts() if re.search(r"fisic|giuridic|non fisic", n, re.I)]
+            for sub in subs[:3]:
+                await page.goto(sub_url, timeout=60000)
+                await page.get_by_role("link", name=sub, exact=True).first.click(timeout=15000)
+                await page.wait_for_load_state("networkidle", timeout=30000)
+                await dump_form(page, f"modulo '{name}' > '{sub}'")
+        except Exception as e:
+            print(f"[ESPLORA] modulo '{name}' non aperto: {e}")
+    await page.goto(scelta, timeout=60000)
+

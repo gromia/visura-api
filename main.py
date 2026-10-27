@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from contextlib import asynccontextmanager
-from utils import login, run_visura, logout, extract_all_sezioni, run_visura_immobile
+from utils import login, run_visura, logout, extract_all_sezioni, run_visura_immobile, explore_sister
 from pydantic import BaseModel, Field, validator
 
 # Configurazione logging
@@ -405,6 +405,12 @@ class VisuraService:
         """Inizializza il servizio"""
         await self.browser_manager.initialize()
         await self.browser_manager.login()
+        if os.getenv("VISURA_EXPLORE"):
+            # ricognizione una tantum dei moduli SISTER (soggetto, indirizzo): nessuna ricerca, solo i campi nei log
+            try:
+                await explore_sister(self.browser_manager.auth_page, os.getenv("VISURA_EXPLORE"))
+            except Exception as e:
+                logger.error(f"Ricognizione SISTER non riuscita: {e}")
         await self.browser_manager.start_keep_alive()
         
         # Avvia il worker per processare le richieste
