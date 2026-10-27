@@ -13,7 +13,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from contextlib import asynccontextmanager
 import utils
 from urllib.parse import urlparse
-from utils import login, run_visura, logout, extract_all_sezioni, run_visura_immobile, explore_sister
+from utils import login, run_visura, logout, extract_all_sezioni, run_visura_immobile, explore_sister, run_ricerca_soggetto, run_ricerca_indirizzo
 from pydantic import BaseModel, Field, validator
 
 # Configurazione logging
@@ -84,6 +84,13 @@ class VisuraIntestatiRequest:
     def __post_init__(self):
         if self.timestamp is None:
             self.timestamp = datetime.now()
+
+@dataclass
+class RicercaRequest:
+    """Ricerca per soggetto (persona fisica o giuridica) o per indirizzo: i campi del modulo SISTER in params"""
+    request_id: str
+    tipo: str  # "soggetto" o "indirizzo"
+    params: Dict
 
 @dataclass
 class VisuraResponse:
@@ -311,6 +318,18 @@ class BrowserManager:
                 error=f"Errore inatteso: {str(e)}",
             )
 
+    async def esegui_ricerca(self, request: RicercaRequest) -> VisuraResponse:
+        """Ricerca per soggetto o per indirizzo: il risultato sono le tabelle della pagina SISTER"""
+        tipo_catasto = request.params.get("tipo_catasto", "")
+        try:
+            await self._ensure_authenticated()
+            run = run_ricerca_soggetto if request.tipo == "soggetto" else run_ricerca_indirizzo
+            result = await run(self.auth_page, **request.params)
+            return VisuraResponse(request_id=request.request_id, success=True, tipo_catasto=tipo_catasto, data=result)
+        except Exception as e:
+            logger.error(f"Errore in ricerca {request.tipo} {request.request_id}: {e}")
+            return VisuraResponse(request_id=request.request_id, success=False, tipo_catasto=tipo_catasto, error=str(e))
+
     async def esegui_visura_intestati(self, request: VisuraIntestatiRequest) -> VisuraResponse:
         """Esegue una visura per ottenere gli intestati di un immobile specifico."""
         try:
@@ -465,6 +484,11 @@ class VisuraService:
                     self.response_store[request.request_id] = response
                     logger.info(f"Processata richiesta visura {request.request_id}")
                 
+                elif isinstance(request, RicercaRequest):
+                    response = await self.browser_manager.esegui_ricerca(request)
+                    self.response_store[request.request_id] = response
+                    logger.info(f"Processata ricerca {request.tipo} {request.request_id}")
+
                 elif isinstance(request, VisuraIntestatiRequest):
                     response = await self.browser_manager.esegui_visura_intestati(request)
                     self.response_store[request.request_id] = response
@@ -582,6 +606,29 @@ class VisuraIntestatiInput(BaseModel):
             raise ValidationError("subalterno non va indicato per i terreni (tipo_catasto='T')")
         return v
 
+class SoggettoInput(BaseModel):
+    """Ricerca per soggetto: persona fisica (cognome e nome, oppure codice fiscale) o giuridica (denominazione, oppure CF/P.IVA)"""
+    provincia: str = Field(..., min_length=1)
+    comune: str = Field("", description="Vuoto = tutta la provincia")
+    tipo_catasto: str = Field("E", pattern=r"^[ETF]$", description="E = terreni e fabbricati")
+    tipo_soggetto: str = Field(..., pattern=r"^(PF|PNF)$")
+    cognome: str = ""
+    nome: str = ""
+    codice_fiscale: str = ""
+    denominazione: str = ""
+    richiedente: str = ""
+    motivo: str = ""
+
+class IndirizzoInput(BaseModel):
+    """Ricerca per indirizzo"""
+    provincia: str = Field(..., min_length=1)
+    comune: str = Field(..., min_length=1)
+    tipo_catasto: str = Field("F", pattern=r"^[TF]$")
+    toponimo: str = Field("", description="VIA, PIAZZA...; vuoto = tutti")
+    indirizzo: str = Field(..., min_length=1)
+    richiedente: str = ""
+    motivo: str = ""
+
 class SezioniExtractionRequest(BaseModel):
     """Richiesta per l'estrazione delle sezioni territoriali"""
     tipo_catasto: str = Field("T", pattern=r"^[TF]$", description="'T' = Terreni, 'F' = Fabbricati")
@@ -658,6 +705,25 @@ async def ottieni_visura(
     except Exception as e:
         logger.error(f"Errore nell'ottenere visura: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+async def _queue_ricerca(service, tipo: str, params: Dict):
+    request_id = f"{tipo}_{int(time.time() * 1000)}"
+    await service.request_queue.put({'request': RicercaRequest(request_id=request_id, tipo=tipo, params=params)})
+    return JSONResponse({"request_id": request_id, "status": "queued", "queue_position": service.request_queue.qsize()})
+
+@app.post("/visura/soggetto")
+async def richiedi_ricerca_soggetto(request: SoggettoInput, service: VisuraService = Depends(get_visura_service)):
+    """Ricerca per soggetto; il risultato si legge con GET /visura/{request_id}"""
+    if request.tipo_soggetto == "PF" and not request.codice_fiscale and not request.cognome:
+        raise HTTPException(status_code=422, detail="Persona fisica: servono cognome (e nome) oppure codice fiscale")
+    if request.tipo_soggetto == "PNF" and not request.codice_fiscale and not request.denominazione:
+        raise HTTPException(status_code=422, detail="Persona giuridica: servono denominazione oppure codice fiscale")
+    return await _queue_ricerca(service, "soggetto", request.dict())
+
+@app.post("/visura/indirizzo")
+async def richiedi_ricerca_indirizzo(request: IndirizzoInput, service: VisuraService = Depends(get_visura_service)):
+    """Ricerca per indirizzo; il risultato si legge con GET /visura/{request_id}"""
+    return await _queue_ricerca(service, "indirizzo", request.dict())
 
 @app.post("/visura/intestati")
 async def richiedi_intestati_immobile(

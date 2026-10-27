@@ -1405,3 +1405,104 @@ async def explore_sister(page: Page, provincia: str):
             print(f"[ESPLORA] modulo '{name}' non aperto: {e}")
     await page.goto(scelta, timeout=60000)
 
+
+
+async def open_ricerca(page: Page, provincia: str, voce: str):
+    """Apre un modulo di ricerca di SISTER per una provincia: voce è il link del menu ("Persona fisica",
+    "Persona giuridica", "Indirizzo")."""
+    await page.goto(scelta_url(), timeout=60000)
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    value = await find_best_option_match(page, "select[name='listacom']", provincia)
+    if not value:
+        raise Exception(f"Provincia '{provincia}' non trovata in SISTER")
+    await page.locator("select[name='listacom']").select_option(value)
+    await page.locator("input[type='submit'][value='Applica']").click()
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    await page.get_by_role("link", name=voce, exact=True).first.click(timeout=15000)
+    await page.wait_for_load_state("networkidle", timeout=30000)
+
+
+async def select_comune(page: Page, comune: str, tutta_provincia: bool):
+    """Comune del modulo (select comuneCat). Senza comune, "TUTTA LA PROVINCIA" dove il modulo la offre."""
+    if not comune:
+        if not tutta_provincia:
+            raise Exception("Serve il comune")
+        await page.locator("select[name='comuneCat']").select_option("$")
+        return
+    value = await find_best_option_match(page, "select[name='comuneCat']", comune)
+    if not value:
+        raise Exception(f"Comune '{comune}' non trovato nella provincia")
+    await page.locator("select[name='comuneCat']").select_option(value)
+
+
+async def fill_motivo(page: Page, richiedente: str, motivo: str):
+    if richiedente and await page.locator("input[name='richiedente']").count():
+        await page.locator("input[name='richiedente']").fill(richiedente[:60])
+    if motivo and await page.locator("input[name='motivoText']").count():
+        await page.locator("input[name='motivoText']").fill(motivo[:100])
+
+
+async def read_results(page: Page, tag: str) -> dict:
+    """Pagina dei risultati di una ricerca: tutte le tabelle con intestazioni, più il testo della pagina, che
+    contiene anche gli eventuali messaggi di SISTER (nessun risultato, dati mancanti). La pagina finisce nei log."""
+    await dump_form(page, tag)
+    tables = []
+    for t in await page.locator("table:has(th)").all():
+        try:
+            rows = parse_table(await t.inner_html(timeout=10000))
+        except Exception:
+            continue
+        rows = [r for r in rows if any(v for v in r.values())]
+        if rows:
+            tables.append(rows)
+    text = (await page.locator("body").inner_text()).strip()
+    return {"tabelle": tables, "messaggio": " ".join(text.split())[-600:], "url": page.url}
+
+
+async def run_ricerca_soggetto(page: Page, provincia: str, comune: str, tipo_catasto: str, tipo_soggetto: str,
+                               cognome: str = "", nome: str = "", codice_fiscale: str = "", denominazione: str = "",
+                               richiedente: str = "", motivo: str = "") -> dict:
+    """Ricerca per soggetto: persona fisica (PF: cognome e nome, oppure codice fiscale) o persona giuridica
+    (PNF: denominazione, oppure codice fiscale / partita IVA). tipo_catasto E = terreni e fabbricati."""
+    print(f"[SOGGETTO] {tipo_soggetto} provincia={provincia} comune={comune or 'tutta la provincia'} catasto={tipo_catasto}")
+    await open_ricerca(page, provincia, "Persona fisica" if tipo_soggetto == "PF" else "Persona giuridica")
+    await page.locator("select[name='tipoCatasto']").select_option(tipo_catasto)
+    await select_comune(page, comune, tutta_provincia=True)
+    if tipo_soggetto == "PF":
+        if codice_fiscale:
+            await page.locator("input[name='selDatiAna'][value='CF_PF']").check()
+            await page.locator("input[name='cod_fisc_pf']").fill(codice_fiscale)
+        else:
+            await page.locator("input[name='selDatiAna'][value='cognome']").check()
+            await page.locator("input[name='cognome']").fill(cognome)
+            await page.locator("input[name='nome']").fill(nome)
+    else:
+        if codice_fiscale:
+            await page.locator("input[name='selCfDn'][value='CF_PNF']").check()
+            await page.locator("input[name='cod_fisc']").fill(codice_fiscale)
+        else:
+            await page.locator("input[name='selCfDn'][value='denominazione']").check()
+            await page.locator("input[name='denominazione']").fill(denominazione)
+    await fill_motivo(page, richiedente, motivo)
+    await page.locator("input[name='ricerca'][value='Ricerca']").click()
+    await page.wait_for_load_state("networkidle", timeout=60000)
+    return await read_results(page, f"risultati ricerca {tipo_soggetto}")
+
+
+async def run_ricerca_indirizzo(page: Page, provincia: str, comune: str, tipo_catasto: str, indirizzo: str,
+                                toponimo: str = "", richiedente: str = "", motivo: str = "") -> dict:
+    """Ricerca per indirizzo: comune, tipo di strada (toponimo: VIA, PIAZZA...; vuoto = tutti) e nome della strada."""
+    print(f"[INDIRIZZO] provincia={provincia} comune={comune} catasto={tipo_catasto} {toponimo} {indirizzo}")
+    await open_ricerca(page, provincia, "Indirizzo")
+    if await page.locator("select[name='tipoCatasto']").count():
+        await page.locator("select[name='tipoCatasto']").select_option(tipo_catasto)
+    await select_comune(page, comune, tutta_provincia=False)
+    if toponimo:
+        value = await find_best_option_match(page, "select[name='toponimo']", toponimo)
+        if value:
+            await page.locator("select[name='toponimo']").select_option(value)
+    await page.locator("input[name='indirizzo']").fill(indirizzo)
+    await fill_motivo(page, richiedente, motivo)
+    await page.locator("input[name='ricerca'][value='Ricerca']").click()
+    await page.wait_for_load_state("networkidle", timeout=60000)
+    return await read_results(page, "risultati ricerca per indirizzo")
