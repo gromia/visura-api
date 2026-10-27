@@ -12,6 +12,8 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from contextlib import asynccontextmanager
+import utils
+from urllib.parse import urlparse
 from utils import login, run_visura, logout, extract_all_sezioni, run_visura_immobile, explore_sister
 from pydantic import BaseModel, Field, validator
 
@@ -197,7 +199,7 @@ class BrowserManager:
         try:
             logger.info("Eseguendo refresh della sessione...")
             
-            await self.auth_page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000)
+            await self.auth_page.goto(utils.scelta_url(), timeout=30000)
             await self.auth_page.wait_for_load_state("networkidle", timeout=15000)
             
             try:
@@ -231,12 +233,12 @@ class BrowserManager:
                 return False
             
             current_url = self.auth_page.url
-            if "sister.agenziaentrate.gov.it" not in current_url:
+            if not utils.SISTER_HOST_RE.match(urlparse(current_url).hostname or ""):
                 logger.warning(f"Non siamo più nel portale SISTER - URL: {current_url}")
                 return False
             
             if "SceltaServizio.do" not in current_url:
-                await self.auth_page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=30000)
+                await self.auth_page.goto(utils.scelta_url(), timeout=30000)
                 await self.auth_page.wait_for_load_state("networkidle", timeout=15000)
             
             provincia_options = await self.auth_page.locator("select[name='listacom'] option").count()

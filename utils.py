@@ -17,8 +17,17 @@ def parse_table(html):
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 import os
 import re
+from urllib.parse import urlparse
 
 LOGIN_URL = "https://iampe.agenziaentrate.gov.it/sam/UI/Login?realm=/agenziaentrate"
+# SISTER risponde su più host (sister, sister3...) e la sessione vale solo su quello dove è avvenuto l'accesso:
+# con le credenziali Sister è sister3. Il login lo annota e tutte le pagine si aprono da lì.
+SISTER_HOST = "sister.agenziaentrate.gov.it"
+SISTER_HOST_RE = re.compile(r"^sister\d*\.agenziaentrate\.gov\.it$")
+
+
+def scelta_url() -> str:
+    return f"https://{SISTER_HOST}/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_"
 
 
 async def login(page: Page):
@@ -71,7 +80,11 @@ async def login(page: Page):
     except Exception:
         await dump_page(page, "menu SISTER non riuscito")
         raise
-    print("[LOGIN] Login completato, SISTER pronto.")
+    global SISTER_HOST
+    host = urlparse(page.url).hostname or ""
+    if SISTER_HOST_RE.match(host):
+        SISTER_HOST = host
+    print(f"[LOGIN] Login completato, SISTER pronto su {SISTER_HOST} ({page.url})")
 
 
 async def sister_locked(page: Page) -> bool:
@@ -283,7 +296,7 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
     
     # STEP 1: Selezione Ufficio Provinciale
     print("[VISURA] Navigando alla pagina di scelta servizio...")
-    await page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+    await page.goto(scelta_url(), timeout=60000)
     await page.wait_for_load_state("networkidle", timeout=30000)
     print("[VISURA] Pagina caricata")
     
@@ -907,7 +920,7 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = 'T', max_province:
         
         # Naviga alla pagina di scelta servizio
         print("[SEZIONI] Navigando alla pagina di scelta servizio...")
-        await page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+        await page.goto(scelta_url(), timeout=60000)
         await page.wait_for_load_state("networkidle", timeout=30000)
         print("[SEZIONI] Pagina caricata")
         
@@ -1056,7 +1069,7 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = 'T', max_province:
                 
                 # Torna alla pagina principale per la prossima provincia
                 print("[SEZIONI] Tornando alla pagina principale per prossima provincia...")
-                await page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+                await page.goto(scelta_url(), timeout=60000)
                 await page.wait_for_load_state("networkidle", timeout=30000)
                 print("[SEZIONI] Tornato alla pagina principale")
                 
@@ -1098,7 +1111,7 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
     
     # STEP 1: Selezione Ufficio Provinciale
     print("[VISURA_IMMOBILE] Navigando alla pagina di scelta servizio...")
-    await page.goto("https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_", timeout=60000)
+    await page.goto(scelta_url(), timeout=60000)
     await page.wait_for_load_state("networkidle", timeout=30000)
     print("[VISURA_IMMOBILE] Pagina caricata")
     
@@ -1363,7 +1376,7 @@ async def dump_form(page: Page, tag: str):
 async def explore_sister(page: Page, provincia: str):
     """Ricognizione dei moduli di ricerca di SISTER per una provincia: apre ogni voce del menu di consultazione
     (Immobile, Soggetto, Indirizzo...) e ne scrive i campi nei log, senza mai lanciare una ricerca."""
-    scelta = "https://sister.agenziaentrate.gov.it/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_"
+    scelta = scelta_url()
     await page.goto(scelta, timeout=60000)
     await page.wait_for_load_state("networkidle", timeout=30000)
     value = await find_best_option_match(page, "select[name='listacom']", provincia if provincia != "1" else "MILANO")
