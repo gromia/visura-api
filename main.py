@@ -105,6 +105,7 @@ class BrowserManager:
         self.authenticated = False
         self.keep_alive_running = False
         self.last_login_time = None
+        self.login_lock = asyncio.Lock()
 
     async def initialize(self):
         """Inizializza il browser e il contexto"""
@@ -131,8 +132,16 @@ class BrowserManager:
             raise BrowserError(f"Browser initialization failed: {e}") from e
         
     async def login(self):
-        """Esegue il login nella prima tab"""
+        """Esegue il login in una scheda nuova. Un login alla volta: lo chiedono sia l'avvio sia le richieste."""
+        async with self.login_lock:
+            if self.authenticated and await self._check_session_validity():
+                return
+            await self._login_page()
+
+    async def _login_page(self):
         try:
+            if self.auth_page and not self.auth_page.is_closed():
+                await self.auth_page.close()
             page = await self.context.new_page()
             await login(page)
             self.auth_page = page
@@ -145,7 +154,9 @@ class BrowserManager:
             raise AuthenticationError(f"Login failed: {e}") from e
 
     async def start_keep_alive(self):
-        """Mantiene la sessione attiva con attività realistiche"""
+        """Mantiene la sessione attiva con attività realistiche (un solo worker, anche dopo un nuovo login)"""
+        if self.keep_alive_running:
+            return
         self.keep_alive_running = True
         
         async def keep_alive_worker():
@@ -404,6 +415,20 @@ class VisuraService:
     async def initialize(self):
         """Inizializza il servizio"""
         await self.browser_manager.initialize()
+        try:
+            await self._after_login()
+        except AuthenticationError as e:
+            # SISTER accetta una sessione alla volta: dopo un riavvio la copia precedente può restare collegata
+            # per qualche minuto. Il servizio parte lo stesso e, con le credenziali Sister, riprova da solo.
+            # Con lo SPID no: ogni tentativo manda una notifica sul telefono.
+            logger.error(f"Login all'avvio non riuscito: {e}")
+            if os.getenv("SISTER_USERNAME"):
+                asyncio.create_task(self._login_retry())
+        
+        # Avvia il worker per processare le richieste
+        asyncio.create_task(self._process_requests())
+        
+    async def _after_login(self):
         await self.browser_manager.login()
         if os.getenv("VISURA_EXPLORE"):
             # ricognizione una tantum dei moduli SISTER (soggetto, indirizzo): nessuna ricerca, solo i campi nei log
@@ -412,10 +437,19 @@ class VisuraService:
             except Exception as e:
                 logger.error(f"Ricognizione SISTER non riuscita: {e}")
         await self.browser_manager.start_keep_alive()
-        
-        # Avvia il worker per processare le richieste
-        asyncio.create_task(self._process_requests())
-        
+
+    async def _login_retry(self):
+        for attempt in range(1, 61):
+            await asyncio.sleep(60)
+            if self.browser_manager.authenticated:
+                return
+            try:
+                await self._after_login()
+                logger.info(f"Login riuscito al tentativo {attempt + 1}")
+                return
+            except Exception as e:
+                logger.error(f"Login non riuscito (tentativo {attempt + 1}): {e}")
+
     async def _process_requests(self):
         """Processa le richieste in coda"""
         self.processing = True

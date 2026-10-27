@@ -39,6 +39,7 @@ async def login(page: Page):
         or "error_locked.jsp" in url
     ):
         print("[LOGIN][ERRORE] Utente già in sessione su un'altra postazione!")
+        await dump_page(page, "utente già in sessione")
         raise Exception("Utente già in sessione su un'altra postazione")
 
     try:
