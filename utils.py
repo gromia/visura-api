@@ -824,6 +824,13 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
 
 async def logout(page: Page):
     """Effettua il logout dal portale SISTER"""
+    # "Esci" di SISTER porta a CloseSessionsSis: andarci direttamente chiude la sessione anche da una pagina qualsiasi
+    try:
+        await page.goto("https://sister3.agenziaentrate.gov.it/Servizi/CloseSessionsSis", timeout=15000)
+        print("[LOGOUT] Sessione SISTER chiusa")
+        return
+    except Exception as e:
+        print(f"[LOGOUT] CloseSessionsSis non raggiunto ({e}), provo il pulsante 'Esci'...")
     try:
         print("[LOGOUT] Cercando il bottone 'Esci'...")
         

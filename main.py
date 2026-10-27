@@ -142,9 +142,9 @@ class BrowserManager:
         try:
             if self.auth_page and not self.auth_page.is_closed():
                 await self.auth_page.close()
-            page = await self.context.new_page()
+            # la scheda diventa subito quella di lavoro: se il login fallisce, il tentativo successivo la chiude
+            page = self.auth_page = await self.context.new_page()
             await login(page)
-            self.auth_page = page
             self.authenticated = True
             self.last_login_time = datetime.now()
             logger.info("Login completato con successo")
