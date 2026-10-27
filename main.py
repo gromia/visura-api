@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import signal
 import sys
 import json
 import os
@@ -521,36 +520,12 @@ def get_visura_service() -> VisuraService:
     return visura_service
 
 # Signal handler per shutdown graceful
-async def shutdown_handler(sig, frame):
-    """Handler per signal di shutdown"""
-    logger.info(f"Ricevuto signal {sig}, iniziando shutdown graceful...")
-    try:
-        if visura_service:
-            await visura_service.graceful_shutdown()
-        logger.info("Shutdown graceful completato, uscita...")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Errore durante shutdown graceful: {e}")
-        sys.exit(1)
-
-def setup_signal_handlers():
-    """Configura i signal handlers per shutdown graceful"""
-    def signal_handler(sig, frame):
-        logger.info(f"Signal {sig} ricevuto, avviando shutdown graceful...")
-        if visura_service:
-            asyncio.create_task(visura_service.graceful_shutdown())
-        logger.info("Shutdown graceful schedulato")
-        sys.exit(0)
-    
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    logger.info("Signal handlers configurati per SIGTERM e SIGINT")
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    # SIGTERM e SIGINT li gestisce uvicorn, che chiude questo lifespan: graceful_shutdown esce da SISTER prima che
+    # il processo finisca, così il riavvio successivo non trova la sessione ancora aperta
     global visura_service
-    setup_signal_handlers()
     visura_service = VisuraService()
     await visura_service.initialize()
     logger.info("Servizio visure avviato")
