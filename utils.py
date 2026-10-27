@@ -18,15 +18,65 @@ from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 import os
 import re
 
+LOGIN_URL = "https://iampe.agenziaentrate.gov.it/sam/UI/Login?realm=/agenziaentrate"
+
+
 async def login(page: Page):
+    """Accesso a SISTER con le credenziali Sister (SISTER_USERNAME, SISTER_PASSWORD) se ci sono, altrimenti
+    con SPID Sielte ID (ADE_USERNAME, ADE_PASSWORD), che chiede l'approvazione sull'app MySielteID."""
+    sister_username, sister_password = os.getenv("SISTER_USERNAME"), os.getenv("SISTER_PASSWORD")
+    if sister_username and sister_password:
+        await login_sister(page, sister_username, sister_password)
+    else:
+        await login_spid(page)
+    print("[LOGIN] Attendo caricamento pagina...")
+    await page.wait_for_load_state("networkidle")
+    print("[LOGIN] Controllo blocco sessione...")
+    content = await page.content()
+    url = page.url
+    if (
+        "Utente gia' in sessione" in content
+        or "error_locked.jsp" in url
+    ):
+        print("[LOGIN][ERRORE] Utente già in sessione su un'altra postazione!")
+        raise Exception("Utente già in sessione su un'altra postazione")
+
+    try:
+        # Chi ha una convenzione sceglie il profilo con "Conferma"; senza, SISTER apre "Adesione ai servizi":
+        # si prova la voce "Consultazioni" e i log riportano cosa compare
+        confirm = page.get_by_role("button", name="Conferma")
+        try:
+            await confirm.wait_for(state="visible", timeout=10000)
+            print("[LOGIN] Clicco 'Conferma'...")
+            await confirm.click()
+        except PlaywrightTimeoutError:
+            await dump_page(page, "SISTER senza 'Conferma'")
+            print("[LOGIN] Nessun 'Conferma': provo 'Consultazioni'...")
+            await page.get_by_role("link", name="Consultazioni", exact=True).first.click(timeout=15000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=30000)
+            except PlaywrightTimeoutError:
+                pass
+            await dump_page(page, "dopo 'Consultazioni'")
+        print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
+        await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
+        print("[LOGIN] Clicco 'Visure catastali'...")
+        await page.get_by_role("link", name="Visure catastali").click()
+        print("[LOGIN] Clicco 'Conferma Lettura'...")
+        await page.get_by_role("link", name="Conferma Lettura").click()
+    except Exception:
+        await dump_page(page, "menu SISTER non riuscito")
+        raise
+    print("[LOGIN] Login completato, SISTER pronto.")
+
+
+async def login_spid(page: Page):
     ade_username = os.getenv("ADE_USERNAME")
     ade_password = os.getenv("ADE_PASSWORD")
-    
     if not ade_username or not ade_password:
-        raise ValueError("ADE_USERNAME and ADE_PASSWORD environment variables must be set")
-    
-    print("[LOGIN] Navigo alla pagina di login...")
-    await page.goto("https://iampe.agenziaentrate.gov.it/sam/UI/Login?realm=/agenziaentrate")
+        raise ValueError("Servono SISTER_USERNAME e SISTER_PASSWORD, oppure ADE_USERNAME e ADE_PASSWORD per lo SPID")
+    print("[LOGIN] Navigo alla pagina di login (SPID)...")
+    await page.goto(LOGIN_URL)
     print("[LOGIN] Clicco 'Entra con SPID'...")
     await page.get_by_role("button", name="Entra con SPID").click()
     print("[LOGIN] Clicco 'Sielte ID'...")
@@ -68,45 +118,28 @@ async def login(page: Page):
         await dump_page(page, "apertura SISTER non riuscita")
         raise
 
-    print("[LOGIN] Attendo caricamento pagina...")
-    await page.wait_for_load_state("networkidle")
-    print("[LOGIN] Controllo blocco sessione...")
-    content = await page.content()
-    url = page.url
-    if (
-        "Utente gia' in sessione" in content
-        or "error_locked.jsp" in url
-    ):
-        print("[LOGIN][ERRORE] Utente già in sessione su un'altra postazione!")
-        raise Exception("Utente già in sessione su un'altra postazione")
 
+async def login_sister(page: Page, username: str, password: str):
+    """Scheda "Sister" della pagina di accesso dell'Agenzia: utente e password Sister, nessuna approvazione sul telefono."""
+    print("[LOGIN] Navigo alla pagina di login (credenziali Sister)...")
+    await page.goto(LOGIN_URL)
+    await page.locator("a[href='#tab-5']").click()
+    await page.locator("#username-sister").fill(username)
+    await page.locator("#password-fo-sist").fill(password)
+    print("[LOGIN] Clicco 'Accedi'...")
+    await page.locator("#tab-5").get_by_role("button", name="Accedi").click()
     try:
-        # Chi ha una convenzione sceglie il profilo con "Conferma"; senza, SISTER apre "Adesione ai servizi":
-        # si prova la voce "Consultazioni" e i log riportano cosa compare
-        confirm = page.get_by_role("button", name="Conferma")
+        await page.wait_for_load_state("networkidle", timeout=60000)
+    except PlaywrightTimeoutError:
+        pass
+    await dump_page(page, "dopo accesso Sister")
+    # se l'accesso porta all'area riservata invece che a SISTER, SISTER si apre dai servizi come con lo SPID
+    if "sister" not in page.url:
         try:
-            await confirm.wait_for(state="visible", timeout=10000)
-            print("[LOGIN] Clicco 'Conferma'...")
-            await confirm.click()
-        except PlaywrightTimeoutError:
-            await dump_page(page, "SISTER senza 'Conferma'")
-            print("[LOGIN] Nessun 'Conferma': provo 'Consultazioni'...")
-            await page.get_by_role("link", name="Consultazioni", exact=True).first.click(timeout=15000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=30000)
-            except PlaywrightTimeoutError:
-                pass
-            await dump_page(page, "dopo 'Consultazioni'")
-        print("[LOGIN] Clicco 'Consultazioni e Certificazioni'...")
-        await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
-        print("[LOGIN] Clicco 'Visure catastali'...")
-        await page.get_by_role("link", name="Visure catastali").click()
-        print("[LOGIN] Clicco 'Conferma Lettura'...")
-        await page.get_by_role("link", name="Conferma Lettura").click()
-    except Exception:
-        await dump_page(page, "menu SISTER non riuscito")
-        raise
-    print("[LOGIN] Login completato, SISTER pronto.")
+            await open_sister(page)
+        except Exception:
+            await dump_page(page, "apertura SISTER non riuscita")
+            raise
 
 
 async def dump_page(page: Page, tag: str):
