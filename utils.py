@@ -27,17 +27,20 @@ async def login(page: Page):
     sister_username, sister_password = os.getenv("SISTER_USERNAME"), os.getenv("SISTER_PASSWORD")
     if sister_username and sister_password:
         await login_sister(page, sister_username, sister_password)
+        # SISTER accetta una sessione alla volta: dopo un riavvio del servizio la copia precedente resta collegata.
+        # La pagina di blocco offre "Chiudi" (CloseSessionsSis), che chiude quella sessione: lo si usa e si rientra.
+        # Chiude anche una sessione aperta a mano con le stesse credenziali.
+        if await sister_locked(page):
+            print("[LOGIN] Utente già in sessione: chiudo la sessione precedente e rientro...")
+            await page.goto("https://sister3.agenziaentrate.gov.it/Servizi/CloseSessionsSis", timeout=60000)
+            await page.wait_for_timeout(3000)
+            await login_sister(page, sister_username, sister_password)
     else:
         await login_spid(page)
     print("[LOGIN] Attendo caricamento pagina...")
     await page.wait_for_load_state("networkidle")
     print("[LOGIN] Controllo blocco sessione...")
-    content = await page.content()
-    url = page.url
-    if (
-        "Utente gia' in sessione" in content
-        or "error_locked.jsp" in url
-    ):
+    if await sister_locked(page):
         print("[LOGIN][ERRORE] Utente già in sessione su un'altra postazione!")
         await dump_page(page, "utente già in sessione")
         raise Exception("Utente già in sessione su un'altra postazione")
@@ -69,6 +72,10 @@ async def login(page: Page):
         await dump_page(page, "menu SISTER non riuscito")
         raise
     print("[LOGIN] Login completato, SISTER pronto.")
+
+
+async def sister_locked(page: Page) -> bool:
+    return "error_locked.jsp" in page.url or "Utente gia' in sessione" in await page.content()
 
 
 async def login_spid(page: Page):
