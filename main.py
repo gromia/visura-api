@@ -506,7 +506,7 @@ class VisuraService:
                 self.request_queue.task_done()
                 
                 # Pausa tra le richieste per non sovraccaricare SISTER
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.5)
                 
             except Exception as e:
                 logger.error(f"Errore nel processare richieste: {e}")

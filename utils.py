@@ -79,8 +79,14 @@ async def login(page: Page):
         await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
         print("[LOGIN] Clicco 'Visure catastali'...")
         await page.get_by_role("link", name="Visure catastali").click()
-        print("[LOGIN] Clicco 'Conferma Lettura'...")
-        await page.get_by_role("link", name="Conferma Lettura").click()
+        # l'informativa da confermare compare solo al primo ingresso della giornata: dopo si arriva subito alla scelta della provincia
+        conferma = page.get_by_role("link", name="Conferma Lettura")
+        try:
+            await conferma.wait_for(state="visible", timeout=5000)
+            print("[LOGIN] Clicco 'Conferma Lettura'...")
+            await conferma.click()
+        except PlaywrightTimeoutError:
+            print("[LOGIN] Nessuna informativa da confermare")
     except Exception:
         await dump_page(page, "menu SISTER non riuscito")
         raise
