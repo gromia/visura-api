@@ -20,6 +20,10 @@ import re
 from urllib.parse import urlparse
 
 LOGIN_URL = "https://iampe.agenziaentrate.gov.it/sam/UI/Login?realm=/agenziaentrate"
+
+
+class CredenzialiErrate(Exception):
+    """L'Agenzia rifiuta utente e password: ritentare non serve e troppi tentativi possono bloccare l'utenza."""
 # SISTER risponde su più host (sister, sister3...) e la sessione vale solo su quello dove è avvenuto l'accesso:
 # con le credenziali Sister è sister3. Il login lo annota e tutte le pagine si aprono da lì.
 SISTER_HOST = "sister.agenziaentrate.gov.it"
@@ -154,6 +158,8 @@ async def login_sister(page: Page, username: str, password: str):
     except PlaywrightTimeoutError:
         pass
     await dump_page(page, "dopo accesso Sister")
+    if "Credenziali errate" in await page.content():
+        raise CredenzialiErrate("SISTER: credenziali errate, controlla SISTER_USERNAME e SISTER_PASSWORD")
     # se l'accesso porta all'area riservata invece che a SISTER, SISTER si apre dai servizi come con lo SPID
     if "sister" not in page.url:
         try:

@@ -13,7 +13,7 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from contextlib import asynccontextmanager
 import utils
 from urllib.parse import urlparse
-from utils import login, run_visura, logout, extract_all_sezioni, run_visura_immobile, explore_sister, run_ricerca_soggetto, run_ricerca_indirizzo
+from utils import CredenzialiErrate, login, run_visura, logout, extract_all_sezioni, run_visura_immobile, explore_sister, run_ricerca_soggetto, run_ricerca_indirizzo
 from pydantic import BaseModel, Field, validator
 
 # Configurazione logging
@@ -114,6 +114,8 @@ class BrowserManager:
         self.keep_alive_running = False
         self.last_login_time = None
         self.login_lock = asyncio.Lock()
+        # dopo "Credenziali errate" non si riprova più fino al riavvio: troppi tentativi bloccano l'utenza Sister
+        self.credenziali_errate = False
 
     async def initialize(self):
         """Inizializza il browser e il contexto"""
@@ -142,6 +144,8 @@ class BrowserManager:
     async def login(self):
         """Esegue il login in una scheda nuova. Un login alla volta: lo chiedono sia l'avvio sia le richieste."""
         async with self.login_lock:
+            if self.credenziali_errate:
+                raise AuthenticationError("Credenziali Sister errate: aggiorna SISTER_USERNAME e SISTER_PASSWORD su Railway")
             if self.authenticated and await self._check_session_validity():
                 return
             await self._login_page()
@@ -159,6 +163,8 @@ class BrowserManager:
         except Exception as e:
             logger.error(f"Errore durante il login: {e}")
             self.authenticated = False
+            if isinstance(e, CredenzialiErrate):
+                self.credenziali_errate = True
             raise AuthenticationError(f"Login failed: {e}") from e
 
     async def start_keep_alive(self):
@@ -461,7 +467,7 @@ class VisuraService:
     async def _login_retry(self):
         for attempt in range(1, 61):
             await asyncio.sleep(60)
-            if self.browser_manager.authenticated:
+            if self.browser_manager.authenticated or self.browser_manager.credenziali_errate:
                 return
             try:
                 await self._after_login()
