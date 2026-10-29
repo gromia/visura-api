@@ -608,7 +608,7 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
                     intestati_button = None
                     for selector in intestati_button_selectors:
                         try:
-                            button = page.locator(selector).first()
+                            button = page.locator(selector).first
                             if await button.count() > 0:
                                 intestati_button = button
                                 print(f"[VISURA] Bottone Intestati trovato con selettore: {selector}")
@@ -745,7 +745,7 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
                 intestati_button = None
                 for selector in intestati_button_selectors:
                     try:
-                        button = page.locator(selector).first()
+                        button = page.locator(selector).first
                         if await button.count() > 0:
                             intestati_button = button
                             print(f"[VISURA] Bottone Intestati trovato con selettore (fallback): {selector}")
@@ -1246,7 +1246,7 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
         intestati_button = None
         for selector in intestati_button_selectors:
             try:
-                button = page.locator(selector).first()
+                button = page.locator(selector).first
                 if await button.count() > 0:
                     intestati_button = button
                     print(f"[VISURA_IMMOBILE] Bottone Intestati trovato con selettore: {selector}")
