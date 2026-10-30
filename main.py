@@ -277,16 +277,27 @@ class BrowserManager:
                 logger.error(f"Errore nella re-autenticazione: {e}")
                 raise AuthenticationError(f"Re-authentication failed: {e}") from e
 
+    async def _run_sessione(self, fn):
+        """Esegue fn(); se SISTER dice che la sessione è scaduta rifà il login e ripete una volta"""
+        await self._ensure_authenticated()
+        try:
+            return await fn()
+        except Exception as e:
+            if not any(k in str(e).lower() for k in ("scadut", "sessione_scaduta", "error_locked", "in sessione")):
+                raise
+            logger.warning(f"Sessione SISTER scaduta durante la richiesta, nuovo login e nuovo tentativo: {e}")
+            self.authenticated = False
+            await self._ensure_authenticated()
+            return await fn()
+
     async def esegui_visura(self, request: VisuraRequest) -> VisuraResponse:
         """Esegue una visura catastale"""
         try:
-            await self._ensure_authenticated()
-            
             try:
                 # Per i terreni estraiamo sempre gli intestati, per i fabbricati no
                 extract_intestati = request.tipo_catasto == 'T'
                 
-                result = await run_visura(
+                result = await self._run_sessione(lambda: run_visura(
                     self.auth_page,
                     request.provincia,
                     request.comune,
@@ -295,7 +306,9 @@ class BrowserManager:
                     request.particella,
                     request.tipo_catasto,
                     extract_intestati
-                )
+                ))
+            except AuthenticationError:
+                raise
             except Exception as e:
                 raise BrowserError(f"Failed to execute visura: {e}") from e
             
@@ -328,9 +341,8 @@ class BrowserManager:
         """Ricerca per soggetto o per indirizzo: il risultato sono le tabelle della pagina SISTER"""
         tipo_catasto = request.params.get("tipo_catasto", "")
         try:
-            await self._ensure_authenticated()
             run = run_ricerca_soggetto if request.tipo == "soggetto" else run_ricerca_indirizzo
-            result = await run(self.auth_page, **request.params)
+            result = await self._run_sessione(lambda: run(self.auth_page, **request.params))
             return VisuraResponse(request_id=request.request_id, success=True, tipo_catasto=tipo_catasto, data=result)
         except Exception as e:
             logger.error(f"Errore in ricerca {request.tipo} {request.request_id}: {e}")
@@ -339,10 +351,8 @@ class BrowserManager:
     async def esegui_visura_intestati(self, request: VisuraIntestatiRequest) -> VisuraResponse:
         """Esegue una visura per ottenere gli intestati di un immobile specifico."""
         try:
-            await self._ensure_authenticated()
-            
             if request.tipo_catasto == 'F' and request.subalterno:
-                result = await run_visura_immobile(
+                result = await self._run_sessione(lambda: run_visura_immobile(
                     self.auth_page,
                     provincia=request.provincia,
                     comune=request.comune,
@@ -350,9 +360,9 @@ class BrowserManager:
                     foglio=request.foglio,
                     particella=request.particella,
                     subalterno=request.subalterno
-                )
+                ))
             else:
-                result = await run_visura(
+                result = await self._run_sessione(lambda: run_visura(
                     self.auth_page,
                     request.provincia,
                     request.comune,
@@ -361,7 +371,7 @@ class BrowserManager:
                     request.particella,
                     request.tipo_catasto,
                     extract_intestati=True
-                )
+                ))
             
             logger.info(f"Visura intestati completata per {request.request_id}")
             return VisuraResponse(
