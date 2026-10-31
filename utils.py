@@ -79,14 +79,7 @@ async def login(page: Page):
         await page.get_by_role("link", name="Consultazioni e Certificazioni").click()
         print("[LOGIN] Clicco 'Visure catastali'...")
         await page.get_by_role("link", name="Visure catastali").click()
-        # l'informativa da confermare compare solo al primo ingresso della giornata: dopo si arriva subito alla scelta della provincia
-        conferma = page.get_by_role("link", name="Conferma Lettura")
-        try:
-            await conferma.wait_for(state="visible", timeout=5000)
-            print("[LOGIN] Clicco 'Conferma Lettura'...")
-            await conferma.click()
-        except PlaywrightTimeoutError:
-            print("[LOGIN] Nessuna informativa da confermare")
+        await conferma_informativa(page)
     except Exception:
         await dump_page(page, "menu SISTER non riuscito")
         raise
@@ -95,6 +88,24 @@ async def login(page: Page):
     if SISTER_HOST_RE.match(host):
         SISTER_HOST = host
     print(f"[LOGIN] Login completato, SISTER pronto su {SISTER_HOST} ({page.url})")
+
+
+async def conferma_informativa(page: Page):
+    """Dopo "Visure catastali" SISTER mostra l'informativa da confermare (non sempre) oppure subito la scelta
+    della provincia. Aspetta la prima delle due, anche quando SISTER è lento: senza conferma la scelta della
+    provincia resta vuota e la sessione scade."""
+    conferma = page.get_by_role("link", name="Conferma Lettura")
+    try:
+        await page.locator("select[name='listacom']").or_(conferma).first.wait_for(state="visible", timeout=30000)
+    except PlaywrightTimeoutError:
+        print(f"[LOGIN] Né informativa né scelta provincia dopo 30 s ({page.url})")
+        return
+    if await conferma.count():
+        print("[LOGIN] Clicco 'Conferma Lettura'...")
+        await conferma.first.click()
+        await page.wait_for_load_state("networkidle", timeout=30000)
+    else:
+        print("[LOGIN] Nessuna informativa da confermare")
 
 
 async def sister_locked(page: Page) -> bool:
@@ -1424,6 +1435,10 @@ async def open_ricerca(page: Page, provincia: str, voce: str):
     "Persona giuridica", "Indirizzo")."""
     await page.goto(scelta_url(), timeout=60000)
     await page.wait_for_load_state("networkidle", timeout=30000)
+    if "Informativa" in page.url:
+        await conferma_informativa(page)
+    if not await page.locator("select[name='listacom'] option").count():
+        raise Exception(f"La sessione sembra essere scaduta: SISTER non mostra l'elenco delle province ({page.url})")
     value = await find_best_option_match(page, "select[name='listacom']", provincia)
     if not value:
         raise Exception(f"Provincia '{provincia}' non trovata in SISTER")

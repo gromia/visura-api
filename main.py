@@ -270,7 +270,14 @@ class BrowserManager:
         if not self.authenticated or not await self._check_session_validity():
             logger.info("Sessione non valida, ri-autenticando...")
             try:
-                await self.login()
+                try:
+                    await self.login()
+                except Exception as e:
+                    if self.credenziali_errate:
+                        raise
+                    # SISTER a volte è lento a caricare il menu: un secondo tentativo di solito basta
+                    logger.warning(f"Login non riuscito, riprovo: {e}")
+                    await self.login()
                 await self.start_keep_alive()
                 logger.info("Re-autenticazione completata")
             except Exception as e:
