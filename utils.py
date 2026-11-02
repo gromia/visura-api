@@ -42,13 +42,13 @@ async def ha_scelta_provincia(page: Page) -> bool:
         return False
 
 
-async def apri_scelta(page: Page):
+async def apri_scelta(page: Page, forza: bool = False):
     """Porta alla scelta della provincia delle visure come farebbe una persona: dal menu di SISTER
     (Consultazioni e Certificazioni > Visure catastali), confermando l'informativa se compare. Aprire
     direttamente l'indirizzo SceltaServizio.do?tipo=... su sister3 fa rispondere a SISTER "sessione scaduta"
     anche con la sessione valida: per questo non lo si fa più. Se la pagina è già la scelta della provincia,
-    non si naviga."""
-    if await ha_scelta_provincia(page) and "Visure/" in page.url:
+    non si naviga (forza=True ripassa comunque dal menu: lo usa il refresh, perché SISTER veda attività)."""
+    if not forza and await ha_scelta_provincia(page) and "Visure/" in page.url:
         return
     await page.goto(f"https://{SISTER_HOST}/Servizi/SceltaServizio.do?area=Consultazioni%20e%20Certificazioni", timeout=60000)
     await page.wait_for_load_state("networkidle", timeout=30000)

@@ -216,7 +216,7 @@ class BrowserManager:
         async with self.page_lock:
             try:
                 logger.info("Eseguendo refresh della sessione...")
-                await utils.apri_scelta(self.auth_page)
+                await utils.apri_scelta(self.auth_page, forza=True)
                 n = await self.auth_page.locator("select[name='listacom'] option").count()
                 logger.info(f"Session refresh completato - {n-1} province disponibili")
                 return True
