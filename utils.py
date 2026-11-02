@@ -34,6 +34,33 @@ def scelta_url() -> str:
     return f"https://{SISTER_HOST}/Visure/SceltaServizio.do?tipo=/T/TM/VCVC_"
 
 
+async def ha_scelta_provincia(page: Page) -> bool:
+    """La pagina mostra l'elenco delle province (scelta dell'ufficio provinciale) con almeno una voce."""
+    try:
+        return await page.locator("select[name='listacom'] option").count() > 1
+    except Exception:
+        return False
+
+
+async def apri_scelta(page: Page):
+    """Porta alla scelta della provincia delle visure come farebbe una persona: dal menu di SISTER
+    (Consultazioni e Certificazioni > Visure catastali), confermando l'informativa se compare. Aprire
+    direttamente l'indirizzo SceltaServizio.do?tipo=... su sister3 fa rispondere a SISTER "sessione scaduta"
+    anche con la sessione valida: per questo non lo si fa più. Se la pagina è già la scelta della provincia,
+    non si naviga."""
+    if await ha_scelta_provincia(page) and "Visure/" in page.url:
+        return
+    await page.goto(f"https://{SISTER_HOST}/Servizi/SceltaServizio.do?area=Consultazioni%20e%20Certificazioni", timeout=60000)
+    await page.wait_for_load_state("networkidle", timeout=30000)
+    visure = page.get_by_role("link", name="Visure catastali")
+    if "sessione_scaduta" in page.url or "Login" in page.url or not await visure.count():
+        raise Exception(f"La sessione sembra essere scaduta: il menu di SISTER non si apre ({page.url})")
+    await visure.first.click(timeout=15000)
+    await conferma_informativa(page)
+    if not await ha_scelta_provincia(page):
+        raise Exception(f"La sessione sembra essere scaduta: SISTER non mostra l'elenco delle province ({page.url})")
+
+
 async def login(page: Page):
     """Accesso a SISTER con le credenziali Sister (SISTER_USERNAME, SISTER_PASSWORD) se ci sono, altrimenti
     con SPID Sielte ID (ADE_USERNAME, ADE_PASSWORD), che chiede l'approvazione sull'app MySielteID."""
@@ -319,13 +346,13 @@ async def run_visura(page, provincia='Trieste', comune='Trieste', sezione=None, 
     
     # STEP 1: Selezione Ufficio Provinciale
     print("[VISURA] Navigando alla pagina di scelta servizio...")
-    await page.goto(scelta_url(), timeout=60000)
+    await apri_scelta(page)
     await page.wait_for_load_state("networkidle", timeout=30000)
     print("[VISURA] Pagina caricata")
     
     # Verifica che siamo realmente nella pagina di scelta servizio
     current_url = page.url
-    if "SceltaServizio.do" not in current_url:
+    if not await ha_scelta_provincia(page):
         raise Exception(f"La sessione sembra essere scaduta o si è verificato un errore durante il caricamento della pagina - URL: {current_url}")
     
     # Verifica che le province siano disponibili
@@ -943,7 +970,7 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = 'T', max_province:
         
         # Naviga alla pagina di scelta servizio
         print("[SEZIONI] Navigando alla pagina di scelta servizio...")
-        await page.goto(scelta_url(), timeout=60000)
+        await apri_scelta(page)
         await page.wait_for_load_state("networkidle", timeout=30000)
         print("[SEZIONI] Pagina caricata")
         
@@ -1092,7 +1119,7 @@ async def extract_all_sezioni(page: Page, tipo_catasto: str = 'T', max_province:
                 
                 # Torna alla pagina principale per la prossima provincia
                 print("[SEZIONI] Tornando alla pagina principale per prossima provincia...")
-                await page.goto(scelta_url(), timeout=60000)
+                await apri_scelta(page)
                 await page.wait_for_load_state("networkidle", timeout=30000)
                 print("[SEZIONI] Tornato alla pagina principale")
                 
@@ -1134,13 +1161,13 @@ async def run_visura_immobile(page, provincia='Trieste', comune='Trieste', sezio
     
     # STEP 1: Selezione Ufficio Provinciale
     print("[VISURA_IMMOBILE] Navigando alla pagina di scelta servizio...")
-    await page.goto(scelta_url(), timeout=60000)
+    await apri_scelta(page)
     await page.wait_for_load_state("networkidle", timeout=30000)
     print("[VISURA_IMMOBILE] Pagina caricata")
     
     # Verifica che siamo realmente nella pagina di scelta servizio
     current_url = page.url
-    if "SceltaServizio.do" not in current_url:
+    if not await ha_scelta_provincia(page):
         raise Exception(f"La sessione sembra essere scaduta o si è verificato un errore - URL: {current_url}")
     
     # Trova e seleziona la provincia corretta
@@ -1399,8 +1426,7 @@ async def dump_form(page: Page, tag: str):
 async def explore_sister(page: Page, provincia: str):
     """Ricognizione dei moduli di ricerca di SISTER per una provincia: apre ogni voce del menu di consultazione
     (Immobile, Soggetto, Indirizzo...) e ne scrive i campi nei log, senza mai lanciare una ricerca."""
-    scelta = scelta_url()
-    await page.goto(scelta, timeout=60000)
+    await apri_scelta(page)
     await page.wait_for_load_state("networkidle", timeout=30000)
     value = await find_best_option_match(page, "select[name='listacom']", provincia if provincia != "1" else "MILANO")
     await page.locator("select[name='listacom']").select_option(value)
@@ -1426,14 +1452,14 @@ async def explore_sister(page: Page, provincia: str):
                 await dump_form(page, f"modulo '{name}' > '{sub}'")
         except Exception as e:
             print(f"[ESPLORA] modulo '{name}' non aperto: {e}")
-    await page.goto(scelta, timeout=60000)
+    await apri_scelta(page)
 
 
 
 async def open_ricerca(page: Page, provincia: str, voce: str):
     """Apre un modulo di ricerca di SISTER per una provincia: voce è il link del menu ("Persona fisica",
     "Persona giuridica", "Indirizzo")."""
-    await page.goto(scelta_url(), timeout=60000)
+    await apri_scelta(page)
     await page.wait_for_load_state("networkidle", timeout=30000)
     if "Informativa" in page.url:
         await conferma_informativa(page)

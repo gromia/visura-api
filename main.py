@@ -114,6 +114,8 @@ class BrowserManager:
         self.keep_alive_running = False
         self.last_login_time = None
         self.login_lock = asyncio.Lock()
+        # una sola cosa alla volta sulla scheda di SISTER: richieste e refresh della sessione non si sovrappongono
+        self.page_lock = asyncio.Lock()
         # dopo "Credenziali errate" non si riprova più fino al riavvio: troppi tentativi bloccano l'utenza Sister
         self.credenziali_errate = False
 
@@ -207,32 +209,22 @@ class BrowserManager:
             logger.warning(f"Errore in light keep-alive: {e}")
     
     async def _perform_session_refresh(self):
-        """Refresh approfondito della sessione navigando alla pagina di scelta servizio"""
-        try:
-            logger.info("Eseguendo refresh della sessione...")
-            
-            await self.auth_page.goto(utils.scelta_url(), timeout=30000)
-            await self.auth_page.wait_for_load_state("networkidle", timeout=15000)
-            
+        """Refresh della sessione: riapre la scelta della provincia dal menu di SISTER. Se una richiesta sta usando
+        la scheda si salta il giro: la richiesta stessa tiene viva la sessione."""
+        if self.page_lock.locked():
+            return True
+        async with self.page_lock:
             try:
-                provincia_options = await self.auth_page.locator("select[name='listacom'] option").count()
-                if provincia_options <= 1:
-                    logger.warning("Sessione scaduta durante refresh - province non disponibili")
-                    self.authenticated = False
-                    return False
-                else:
-                    logger.info(f"Session refresh completato - {provincia_options-1} province disponibili")
-                    return True
+                logger.info("Eseguendo refresh della sessione...")
+                await utils.apri_scelta(self.auth_page)
+                n = await self.auth_page.locator("select[name='listacom'] option").count()
+                logger.info(f"Session refresh completato - {n-1} province disponibili")
+                return True
             except Exception as e:
-                logger.warning(f"Errore nel verificare province: {e}")
+                logger.warning(f"Sessione scaduta durante refresh: {e}")
                 self.authenticated = False
                 return False
-                
-        except Exception as e:
-            logger.error(f"Errore in session refresh: {e}")
-            self.authenticated = False
-            return False
-    
+
     async def stop_keep_alive(self):
         """Ferma il keep-alive"""
         self.keep_alive_running = False
@@ -249,9 +241,8 @@ class BrowserManager:
                 logger.warning(f"Non siamo più nel portale SISTER - URL: {current_url}")
                 return False
             
-            if "SceltaServizio.do" not in current_url:
-                await self.auth_page.goto(utils.scelta_url(), timeout=30000)
-                await self.auth_page.wait_for_load_state("networkidle", timeout=15000)
+            if not await utils.ha_scelta_provincia(self.auth_page):
+                await utils.apri_scelta(self.auth_page)
             
             provincia_options = await self.auth_page.locator("select[name='listacom'] option").count()
             if provincia_options <= 1:
@@ -285,6 +276,11 @@ class BrowserManager:
                 raise AuthenticationError(f"Re-authentication failed: {e}") from e
 
     async def _run_sessione(self, fn):
+        """Esegue fn() con la scheda di SISTER tutta per sé (niente refresh in mezzo)"""
+        async with self.page_lock:
+            return await self._run_sessione_unlocked(fn)
+
+    async def _run_sessione_unlocked(self, fn):
         """Esegue fn(); se SISTER dice che la sessione è scaduta rifà il login e ripete una volta"""
         await self._ensure_authenticated()
         try:
