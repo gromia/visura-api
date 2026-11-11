@@ -42,7 +42,7 @@ Una ricerca sconosciuta (servizio riavviato) risponde 404.
 
 `SISTER_USERNAME`, `SISTER_PASSWORD` (le inserisce l'utente su Railway). Facoltative: `SISTER_CONVENZIONE`,
 `IDLE_SECONDI`, `TEMPO_MAX_RICERCA`, `ATTESA_UTENZA_OCCUPATA`, `PAUSA_UTENZA_OCCUPATA`, `MAX_INTESTATI`,
-`CONSERVA_ORE`. `VISURA_SELFTEST` (JSON di una ricerca) la esegue all'avvio e scrive nei log solo la forma del
+`CONSERVA_ORE`. `VISURA_SELFTEST` (JSON di una ricerca, o un elenco) la esegue all'avvio e scrive nei log solo la forma del
 risultato (colonne e numeri, mai nomi), per controllare il servizio dopo un rilascio.
 
 ## Prove

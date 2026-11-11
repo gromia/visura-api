@@ -283,10 +283,12 @@ async def lifespan(app: FastAPI):
     prova = os.environ.get("VISURA_SELFTEST", "").strip()
     if prova:
         try:
-            l = Lavoro(Corpo(ricerca=json.loads(prova)).ricerca)
-            LAVORI[l.id] = l
-            await LAVORATORE.coda.put(l)
-            asyncio.create_task(_riassumi(l))
+            dati = json.loads(prova)
+            for d in dati if isinstance(dati, list) else [dati]:
+                l = Lavoro(Corpo(ricerca=d).ricerca)
+                LAVORI[l.id] = l
+                await LAVORATORE.coda.put(l)
+                asyncio.create_task(_riassumi(l))
         except Exception as e:
             log.error("VISURA_SELFTEST non valido: %s", e)
     log.info("servizio visure avviato (credenziali %s)", "presenti" if USERNAME and PASSWORD else "MANCANTI")
@@ -305,8 +307,8 @@ async def _riassumi(l: Lavoro):
     x = l.risultato or {}
     imm = x.get("immobili", [])
     con = next((i["intestati"] for i in imm if i.get("intestati")), None) or [{}]
-    log.info("SELFTEST %s: errore=%s immobili=%d soggetti=%d colonne=%s intestati=%s colonne_intestati=%s avvisi=%s",
-             l.stato, l.errore, len(imm), len(x.get("soggetti", [])), list(imm[0]["dati"]) if imm else [],
+    log.info("SELFTEST %s %s: errore=%s immobili=%d soggetti=%d colonne=%s intestati=%s colonne_intestati=%s avvisi=%s",
+             l.richiesta.tipo, l.stato, l.errore, len(imm), len(x.get("soggetti", [])), list(imm[0]["dati"]) if imm else [],
              [len(i["intestati"] or []) for i in imm][:10], list(con[0]), x.get("avvisi"))
 
 
