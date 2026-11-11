@@ -107,7 +107,7 @@ MENU_BASE = [("Consultazioni e Certificazioni", "/Servizi/consultazioni"), ("Esc
 def menu_visure(s):
     """Come su SISTER: scelto l'ufficio, il menu ha solo le ricerche (non più Consultazioni e Certificazioni)."""
     if s.get("ufficio"):
-        return [("Persona fisica", "/Visure/pf"), ("Persona giuridica", "/Visure/pnf"), ("Immobile", "/Visure/immobile"),
+        return [("Cambia Ufficio", "/Visure/visure"), ("Persona fisica", "/Visure/pf"), ("Persona giuridica", "/Visure/pnf"), ("Immobile", "/Visure/immobile"),
                 ("Indirizzo", "/Visure/indirizzo"), ("Elenco immobili", "/Visure/elenco_imm")]
     return MENU_BASE + [("Visure catastali", "/Visure/visure")]
 

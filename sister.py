@@ -315,7 +315,7 @@ class Sessione:
         altrove = p.locator("a").filter(has_text=re.compile(r"Consultazioni e Certificazioni", re.I))
         if await altrove.count():
             return await self.naviga(altrove.first)
-        log.info("torno alla home dei servizi (collegamenti della pagina: %s)", await self._collegamenti())
+        log.info("torno alla home dei servizi")
         await p.goto(urljoin(self.host or SISTER_HOME, "/Servizi/"), wait_until="domcontentloaded", timeout=T_PAGE)
         await self.controlla()
         conferma = p.locator("form[name=PrivacyFB] input[type=submit][value=Conferma]")
@@ -323,15 +323,13 @@ class Sessione:
             await self.naviga(conferma.first)
         await self._clicca_menu(r"Consultazioni e Certificazioni")
 
-    async def _collegamenti(self) -> list[str]:
-        """Testi e indirizzi dei collegamenti della pagina, per i log (non ci sono dati delle persone)."""
-        return await self.page.evaluate(
-            "() => [...document.querySelectorAll('a')].map(a => (a.innerText || '').trim().slice(0, 40) + ' -> ' + "
-            "(a.getAttribute('href') || '').slice(0, 80)).filter(x => x.length > 4).slice(0, 40)")
-
     async def mantieni(self):
-        """Un giro nel menu, perché SISTER non chiuda la sessione per inattività."""
+        """Un giro nel menu, perché SISTER non chiuda la sessione per inattività: dentro le visure apre la
+        ricerca per immobile (l'ufficio resta quello), altrimenti Consultazioni e Certificazioni."""
         self.fase("Sessione SISTER attiva")
+        if self.ufficio and await self._link_menu(r"^\s*Immobile\s*$").count():
+            await self._clicca_menu(r"^\s*Immobile\s*$")
+            return
         await self.consultazioni()
         self.ufficio = ""
 
@@ -348,8 +346,13 @@ class Sessione:
             return
         self.fase(f"Scelta dell'ufficio di {uffici[0].title()}")
         self.ufficio = ""
-        await self.consultazioni()
-        await self._clicca_menu(r"Visure catastali")
+        # dentro le visure c'è "Cambia Ufficio", che porta alla scelta dell'ufficio; altrimenti dal menu
+        cambia = p.locator("a").filter(has_text=re.compile(r"^\s*Cambia Ufficio\s*$", re.I))
+        if await cambia.count():
+            await self.naviga(cambia.first)
+        else:
+            await self.consultazioni()
+            await self._clicca_menu(r"Visure catastali")
         # l'informativa "Conferma Lettura" compare solo a volte; poi forse la convenzione; poi gli uffici
         pronto = p.locator("select[name=listacom], form[name=SelConv]")
         lettura = p.get_by_text("Conferma Lettura", exact=True)
