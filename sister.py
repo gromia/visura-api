@@ -62,6 +62,10 @@ class SessionePersa(SisterError):
     """SISTER ha chiuso la sessione (scaduta, o aperta da un'altra parte): si rientra e si ripete."""
 
 
+class SenzaIntestati(SisterError):
+    """SISTER non dà gli intestati di un'unità (per esempio un bene comune non censibile): resta sull'elenco."""
+
+
 class NonTrovato(SisterError):
     """Dati che SISTER non conosce (comune, via, particella): ripetere dà lo stesso risultato."""
 
@@ -136,6 +140,7 @@ class Sessione:
     context: Optional[BrowserContext] = None
     page: Optional[Page] = None
     aperta: bool = False
+    accesso_tentato: bool = False   # "Accedi" premuto: una sessione può essere aperta anche se apri() non è finito
     host: str = ""
     ufficio: str = ""        # ufficio scelto nella sessione ("MILANO Territorio")
     fase: Callable[[str], None] = field(default=lambda s: None)
@@ -153,6 +158,7 @@ class Sessione:
         await p.locator('a[href="#tab-5"]').first.click(timeout=T_PAGE)          # scheda "Sister"
         await p.locator("#username-sister").fill(self.username)
         await p.locator("#password-fo-sist").fill(self.password)
+        self.accesso_tentato = True
         await p.locator("#tab-5 button.btn-primary").first.click()               # "Accedi"
         await self._attendi_home()
 
@@ -192,7 +198,7 @@ class Sessione:
             raise SessionePersa("La home di SISTER non si è caricata dopo l'accesso.")
         messaggio = await self._messaggio()
         if re.search(r"utente gi.{0,3} in sessione", messaggio, re.I) or "error_locked" in p.url:
-            self.aperta = False   # la sessione aperta è quella di qualcun altro: non va chiusa da qui
+            self.aperta = self.accesso_tentato = False   # la sessione aperta è di qualcun altro: non va chiusa da qui
             raise UtenzaOccupata("L'utenza SISTER è già in uso (qualcuno è collegato a mano o c'è un'altra sessione aperta).")
         if re.search(r"account bloccato", messaggio, re.I):
             raise LoginRifiutato("SISTER dice che l'utenza è bloccata.")
@@ -201,6 +207,7 @@ class Sessione:
         if await conferma.count():
             async with p.expect_navigation(wait_until="domcontentloaded", timeout=T_PAGE):
                 await conferma.first.click()
+        await self.controlla()
         try:
             await self._link_menu(r"Consultazioni e Certificazioni").wait_for(timeout=T_PAGE)
         except PWTimeout:
@@ -229,7 +236,7 @@ class Sessione:
         """Esce da SISTER e dalla pagina unica, sempre, anche dopo un errore: una sessione lasciata aperta
         blocca ogni altro accesso con la stessa utenza."""
         try:
-            if self.aperta and self.page:
+            if (self.aperta or self.accesso_tentato) and self.page:
                 try:
                     await self.page.goto(urljoin(self.host or SISTER_HOME, "/Servizi/CloseSessionsSis"), timeout=20_000)
                 except Exception as e:
@@ -240,7 +247,7 @@ class Sessione:
                     log.warning("logout della pagina unica non riuscito: %s", type(e).__name__)
                 log.info("uscito da SISTER")
         finally:
-            self.aperta = False
+            self.aperta = self.accesso_tentato = False
             await self._chiudi_contesto()
 
     async def _chiudi_contesto(self):
@@ -299,6 +306,35 @@ class Sessione:
                     break
         await self.naviga(link)
 
+    async def consultazioni(self):
+        """Consultazioni e Certificazioni. Dentro le visure il menu a sinistra non l'ha più (ha le ricerche):
+        si cerca il collegamento nel resto della pagina e, se non c'è, si torna alla home dei servizi."""
+        p = self.page
+        if await self._link_menu(r"Consultazioni e Certificazioni").count():
+            return await self._clicca_menu(r"Consultazioni e Certificazioni")
+        altrove = p.locator("a").filter(has_text=re.compile(r"Consultazioni e Certificazioni", re.I))
+        if await altrove.count():
+            return await self.naviga(altrove.first)
+        log.info("torno alla home dei servizi (collegamenti della pagina: %s)", await self._collegamenti())
+        await p.goto(urljoin(self.host or SISTER_HOME, "/Servizi/"), wait_until="domcontentloaded", timeout=T_PAGE)
+        await self.controlla()
+        conferma = p.locator("form[name=PrivacyFB] input[type=submit][value=Conferma]")
+        if await conferma.count():
+            await self.naviga(conferma.first)
+        await self._clicca_menu(r"Consultazioni e Certificazioni")
+
+    async def _collegamenti(self) -> list[str]:
+        """Testi e indirizzi dei collegamenti della pagina, per i log (non ci sono dati delle persone)."""
+        return await self.page.evaluate(
+            "() => [...document.querySelectorAll('a')].map(a => (a.innerText || '').trim().slice(0, 40) + ' -> ' + "
+            "(a.getAttribute('href') || '').slice(0, 80)).filter(x => x.length > 4).slice(0, 40)")
+
+    async def mantieni(self):
+        """Un giro nel menu, perché SISTER non chiuda la sessione per inattività."""
+        self.fase("Sessione SISTER attiva")
+        await self.consultazioni()
+        self.ufficio = ""
+
     # -- ufficio provinciale --
 
     async def scegli_ufficio(self, provincia: str, comune: str = ""):
@@ -306,8 +342,13 @@ class Sessione:
         sempre dal menu: aprire gli indirizzi di SISTER direttamente fa rispondere "sessione scaduta"."""
         p = self.page
         uffici = ufficio_per(provincia, comune)
+        # stesso ufficio della ricerca di prima: le ricerche sono già nel menu
+        if (self.ufficio and any(chiave(self.ufficio).startswith(chiave(u)) for u in uffici)
+                and await self._link_menu(r"^\s*Immobile\s*$").count()):
+            return
         self.fase(f"Scelta dell'ufficio di {uffici[0].title()}")
-        await self._clicca_menu(r"Consultazioni e Certificazioni")
+        self.ufficio = ""
+        await self.consultazioni()
         await self._clicca_menu(r"Visure catastali")
         # l'informativa "Conferma Lettura" compare solo a volte; poi forse la convenzione; poi gli uffici
         pronto = p.locator("select[name=listacom], form[name=SelConv]")
@@ -407,6 +448,11 @@ class Sessione:
                 raise SessionePersa("SISTER ha perso l'elenco degli immobili.")
         await radio.first.check()
         await self._invia("input[type=submit][name=intestati]")
+        if await p.locator("input[type=submit][name=intestati]").count():
+            # ancora l'elenco: SISTER non ha gli intestati di questa unità e lo dice nel suo messaggio
+            messaggio = await self._messaggio()
+            log.info("unità senza intestati: %s", messaggio[:160])
+            raise SenzaIntestati(messaggio or "SISTER non dà gli intestati di questa unità.")
         righe = [pulisci(r) for r in await self.tabella()]
         indietro = p.locator("input[type=submit][name=indietro]")
         if await indietro.count():
@@ -531,6 +577,8 @@ async def _con_intestati(s: Sessione, righe: list[Riga], catasto: str, rifai, ma
             s.fase(f"Lettura degli intestati: unità {i + 1} di {min(len(righe), max_intestati)}")
             try:
                 voce["intestati"] = await s.intestati_di(r, rifai)
+            except SenzaIntestati as e:
+                voce["errore_intestati"] = str(e)
             except SessionePersa:
                 raise
             except Exception as e:

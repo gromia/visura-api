@@ -46,6 +46,8 @@ IMMOBILI = {
          "Rendita": "Euro:600,00", "Indirizzo": "VIA ROMA n. 10 piano: 3"},
         {"Foglio": "520", "Particella": "515", "Sub": "30", "Categoria": "C/6", "Classe": "5", "Consistenza": "12 m2",
          "Rendita": "Euro:90,00", "Indirizzo": "VIA ROMA n. 10 piano: S1"},
+        {"Foglio": "520", "Particella": "515", "Sub": "41", "Categoria": "F/1", "Classe": "", "Consistenza": "",
+         "Rendita": "", "Indirizzo": "VIA ROMA n. 10 piano: T"},
     ],
 }
 TERRENI = {("MILANO", "12", "34"): [{"Foglio": "12", "Particella": "34", "Qualita": "SEMINATIVO", "Superficie": "1200"}]}
@@ -103,11 +105,11 @@ MENU_BASE = [("Consultazioni e Certificazioni", "/Servizi/consultazioni"), ("Esc
 
 
 def menu_visure(s):
-    m = MENU_BASE + [("Visure catastali", "/Visure/visure")]
+    """Come su SISTER: scelto l'ufficio, il menu ha solo le ricerche (non più Consultazioni e Certificazioni)."""
     if s.get("ufficio"):
-        m += [("Immobile", "/Visure/immobile"), ("Indirizzo", "/Visure/indirizzo"),
-              ("Persona fisica", "/Visure/pf"), ("Persona giuridica", "/Visure/pnf")]
-    return m
+        return [("Persona fisica", "/Visure/pf"), ("Persona giuridica", "/Visure/pnf"), ("Immobile", "/Visure/immobile"),
+                ("Indirizzo", "/Visure/indirizzo"), ("Elenco immobili", "/Visure/elenco_imm")]
+    return MENU_BASE + [("Visure catastali", "/Visure/visure")]
 
 
 def scaduta():
@@ -174,6 +176,7 @@ async def home(req: Request):
     s = sessione(req)
     if not s:
         return scaduta()
+    s["ufficio"] = None
     if not s["privacy"]:
         return pagina("<form name='PrivacyFB' method='post' action='/Servizi/privacy'><input type='submit' value='Conferma'></form>",
                       [("Consultazioni e Certificazioni", "/Servizi/consultazioni")], "Benvenuto, il tuo ultimo accesso...")
@@ -194,6 +197,7 @@ async def consultazioni(req: Request):
     s = sessione(req)
     if not s:
         return scaduta()
+    s["ufficio"] = None
     return pagina("<p>Consultazioni</p>", MENU_BASE + [("Visure catastali", "/Visure/visure")])
 
 
@@ -283,7 +287,7 @@ async def immobile_cerca(req: Request):
     return elenco_immobili(s)
 
 
-def elenco_immobili(s):
+def elenco_immobili(s, messaggio=""):
     tipo, k, sub = s["elenco"]
     righe = (TERRENI if tipo == "T" else IMMOBILI).get(k, [])
     if sub:
@@ -293,7 +297,7 @@ def elenco_immobili(s):
     valori = [("T" + r["Particella"]) if tipo == "T" else r["Sub"] for r in righe]
     return pagina(f"<form method='post' action='/Visure/intestati'>{tabella(righe, 'visImm', valori)}"
                   "<input type='submit' name='intestati' value='Intestati'><input type='submit' name='indietro' value='Indietro'></form>",
-                  menu_visure(s))
+                  menu_visure(s), messaggio)
 
 
 @app.post("/Visure/intestati")
@@ -303,6 +307,8 @@ async def intestati(req: Request):
         return scaduta()
     f = await req.form()
     v = f.get("visImm")
+    if v == "41":   # bene comune non censibile: SISTER resta sull'elenco con un messaggio
+        return elenco_immobili(s, "Per l'immobile selezionato non sono presenti intestati")
     righe = INTESTATI.get(v, [])
     return pagina(f"<form method='post' action='/Visure/elenco'>{tabella(righe, 'x', [str(i) for i in range(len(righe))])}"
                   "<input type='submit' name='indietro' value='Indietro'></form>", menu_visure(s))

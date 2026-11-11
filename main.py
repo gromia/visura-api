@@ -6,9 +6,12 @@ con il motivo); GET /stato dice se il servizio è pronto. Il servizio si raggiun
 Railway (dal sito, VISURA_URL), senza dominio pubblico.
 
 SISTER consente una sola sessione per utenza, quindi le ricerche passano da un solo lavoratore, una alla
-volta. La sessione si apre alla prima ricerca e si chiude IDLE_SECONDI dopo l'ultima: tra una ricerca e
-l'altra l'utenza resta libera anche per chi entra a mano. Se SISTER chiude la sessione a metà, il lavoratore
-rientra e ripete la ricerca una volta; se l'utenza è aperta altrove aspetta e riprova; se SISTER rifiuta le
+volta. Con SESSIONE_SEMPRE_APERTA (il default) la sessione si apre all'avvio e resta aperta: ogni
+KEEPALIVE_SECONDI il lavoratore ripassa dal menu di SISTER perché non scada, e se SISTER la chiude rientra
+subito (ogni PAUSA_UTENZA_OCCUPATA secondi finché non ci riesce). Così l'utenza è sempre del servizio:
+nessuno può usarla a mano. Con SESSIONE_SEMPRE_APERTA=0 invece la sessione si apre alla prima ricerca e si
+chiude IDLE_SECONDI dopo l'ultima. Se SISTER chiude la sessione a metà ricerca, il lavoratore rientra e
+ripete la ricerca una volta; se l'utenza è aperta altrove aspetta e riprova; se SISTER rifiuta le
 credenziali smette di provarci (altri tentativi bloccherebbero l'utenza) finché non si riavvia il servizio.
 """
 from __future__ import annotations
@@ -34,7 +37,9 @@ log = logging.getLogger("visura")
 
 USERNAME = os.environ.get("SISTER_USERNAME", "")
 PASSWORD = os.environ.get("SISTER_PASSWORD", "")
-IDLE_SECONDI = float(os.environ.get("IDLE_SECONDI", "60"))               # sessione aperta dopo l'ultima ricerca
+SEMPRE_APERTA = os.environ.get("SESSIONE_SEMPRE_APERTA", "1").lower() not in ("0", "false", "no")
+KEEPALIVE = float(os.environ.get("KEEPALIVE_SECONDI", "180"))           # giro nel menu con la sessione sempre aperta
+IDLE_SECONDI = float(os.environ.get("IDLE_SECONDI", "60"))               # senza: sessione aperta dopo l'ultima ricerca
 TEMPO_MAX = float(os.environ.get("TEMPO_MAX_RICERCA", "420"))            # una ricerca, intestati compresi
 ATTESA_OCCUPATA = float(os.environ.get("ATTESA_UTENZA_OCCUPATA", "480"))  # quanto aspettare l'utenza libera
 PAUSA_OCCUPATA = float(os.environ.get("PAUSA_UTENZA_OCCUPATA", "30"))
@@ -110,7 +115,8 @@ class Lavoro:
 
 
 LAVORI: dict[str, Lavoro] = {}
-STATO = {"sessione": False, "blocco": None, "ultimo_errore": None, "ultima_ricerca": None}
+STATO = {"sessione": False, "blocco": None, "ultimo_errore": None, "ultima_ricerca": None, "aperta_dal": None,
+         "ultimo_keepalive": None, "rientri": 0}
 
 
 def _pulisci_vecchi():
@@ -175,7 +181,7 @@ class Lavoratore:
             self.sessione.fase = lambda f: setattr(l, "fase", f)
             try:
                 await self.sessione.apri()
-                STATO["sessione"] = True
+                STATO.update(sessione=True, aperta_dal=time.time(), rientri=STATO["rientri"] + 1)
                 return
             except sister.UtenzaOccupata:
                 await self.chiudi_sessione()
@@ -234,13 +240,52 @@ class Lavoratore:
                 l.stato, l.errore = "errore", f"Errore imprevisto del servizio visure ({type(e).__name__}): riprova."
                 return
 
+    def _aperta(self) -> bool:
+        return bool(self.sessione and self.sessione.aperta)
+
+    async def mantieni(self):
+        """Sessione sempre aperta: la apre se è chiusa, se no ripassa dal menu perché SISTER non la chiuda.
+        Un errore qui chiude la sessione: il giro dopo rientra."""
+        if STATO["blocco"]:
+            return
+        try:
+            if self._aperta():
+                await asyncio.wait_for(self.sessione.mantieni(), 90)
+                STATO["ultimo_keepalive"] = time.time()
+                return
+            await self.chiudi_sessione()
+            self.sessione = sister.Sessione(await self._browser(), USERNAME, PASSWORD)
+            await asyncio.wait_for(self.sessione.apri(), 150)
+            STATO.update(sessione=True, aperta_dal=time.time(), rientri=STATO["rientri"] + 1)
+            log.info("sessione SISTER aperta")
+        except sister.LoginRifiutato as e:
+            STATO["blocco"] = str(e)
+            log.error("login rifiutato, nessun altro tentativo: %s", e)
+            await self.chiudi_sessione()
+        except sister.UtenzaOccupata:
+            log.warning("utenza occupata altrove: riprovo tra %ss", int(PAUSA_OCCUPATA))
+            await self.chiudi_sessione()
+        except Exception as e:
+            log.warning("sessione da riaprire (%s): %s", type(e).__name__, str(e)[:200])
+            await self.chiudi_sessione()
+
     async def ciclo(self):
         while True:
+            if SEMPRE_APERTA and not self._aperta() and not STATO["blocco"]:
+                await self.mantieni()
+            if SEMPRE_APERTA:
+                attesa = None if STATO["blocco"] else KEEPALIVE if self._aperta() else PAUSA_OCCUPATA
+            else:
+                attesa = IDLE_SECONDI if self.sessione else None
             try:
-                l = await asyncio.wait_for(self.coda.get(), timeout=IDLE_SECONDI if self.sessione else None)
+                l = await asyncio.wait_for(self.coda.get(), timeout=attesa)
             except asyncio.TimeoutError:
-                log.info("nessuna ricerca da %ss: esco da SISTER", int(IDLE_SECONDI))
-                await self.chiudi_sessione()
+                if SEMPRE_APERTA:
+                    if self._aperta():
+                        await self.mantieni()
+                else:
+                    log.info("nessuna ricerca da %ss: esco da SISTER", int(IDLE_SECONDI))
+                    await self.chiudi_sessione()
                 continue
             try:
                 await self.esegui(l)
@@ -296,6 +341,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         compito.cancel()
+        try:
+            await compito
+        except BaseException:
+            pass
         await LAVORATORE.ferma()
         log.info("servizio visure fermato, sessione SISTER chiusa")
 
@@ -344,7 +393,8 @@ async def leggi(id: str):
 @app.get("/stato")
 async def stato():
     return {"ok": not STATO["blocco"] and bool(USERNAME and PASSWORD), "credenziali": bool(USERNAME and PASSWORD),
-            "sessione_aperta": STATO["sessione"], "in_coda": LAVORATORE.coda.qsize(), "blocco": STATO["blocco"],
+            "sessione_aperta": STATO["sessione"], "sempre_aperta": SEMPRE_APERTA, "aperta_dal": STATO["aperta_dal"],
+            "ultimo_keepalive": STATO["ultimo_keepalive"], "rientri": STATO["rientri"], "in_coda": LAVORATORE.coda.qsize(), "blocco": STATO["blocco"],
             "ultimo_errore": STATO["ultimo_errore"], "ultima_ricerca": STATO["ultima_ricerca"]}
 
 

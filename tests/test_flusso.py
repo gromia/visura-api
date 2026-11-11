@@ -50,14 +50,38 @@ from fastapi.testclient import TestClient  # noqa: E402
 import main  # noqa: E402
 
 
-@pytest.fixture()
-def client():
+def _nuovo(sempre_aperta: bool):
     fake_sister.azzera()
-    main.STATO.update(blocco=None, sessione=False, ultimo_errore=None, ultima_ricerca=None)
+    main.SEMPRE_APERTA = sempre_aperta
+    main.STATO.update(blocco=None, sessione=False, ultimo_errore=None, ultima_ricerca=None, rientri=0)
     main.LAVORI.clear()
     main.LAVORATORE = main.Lavoratore()
+
+
+@pytest.fixture()
+def client():
+    """Sessione aperta solo per le ricerche (SESSIONE_SEMPRE_APERTA=0)."""
+    _nuovo(False)
     with TestClient(main.app) as c:
         yield c
+
+
+@pytest.fixture()
+def sempre():
+    """Sessione sempre aperta, con il giro nel menu ogni secondo."""
+    _nuovo(True)
+    main.KEEPALIVE = 1
+    with TestClient(main.app) as c:
+        yield c
+    main.KEEPALIVE = 180
+
+
+def attendi(cond, secondi=20):
+    for _ in range(int(secondi * 10)):
+        if cond():
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def cerca(c, **r):
@@ -79,7 +103,8 @@ def test_particella_con_intestati(client):
     j = cerca(client, **PART)
     assert j["stato"] == "completata", j["errore"]
     imm = j["risultato"]["immobili"]
-    assert [i["dati"]["Sub"] for i in imm] == ["1", "26", "30"]
+    assert [i["dati"]["Sub"] for i in imm] == ["1", "26", "30", "41"]
+    assert imm[3]["intestati"] is None and "non sono presenti intestati" in imm[3]["errore_intestati"]
     assert [x["Nominativo o denominazione"] for x in imm[1]["intestati"]] == ["MONTE ALBERTO", "BIANCHI ANNA"]
     assert all(i["catasto"] == "F" for i in imm)
     assert STATO["logins"] == 1
@@ -123,7 +148,7 @@ def test_indirizzo(client):
     j = cerca(client, tipo="indirizzo", provincia="MI", comune="Milano", indirizzo="via roma 10")
     assert j["stato"] == "completata", j["errore"]
     assert j["risultato"]["via"] == "VIA ROMA"
-    assert len(j["risultato"]["immobili"]) == 3
+    assert len(j["risultato"]["immobili"]) == 4
     assert j["risultato"]["immobili"][0]["intestati"][0]["Nominativo o denominazione"] == "ROSSI MARIO"
 
 
@@ -155,7 +180,7 @@ def test_sessione_che_scade_a_meta(client):
     STATO["scadi_dopo"] = 12   # SISTER chiude la sessione durante la lettura degli intestati
     j = cerca(client, **PART)
     assert j["stato"] == "completata", j["errore"]
-    assert len(j["risultato"]["immobili"]) == 3
+    assert len(j["risultato"]["immobili"]) == 4
     assert STATO["logins"] == 2
 
 
@@ -186,6 +211,7 @@ def test_esce_dopo_inattivita_e_tra_ricerche_resta_dentro(client):
     cerca(client, **PART)
     cerca(client, tipo="indirizzo", provincia="MI", comune="Milano", indirizzo="via roma", civico="10")
     assert STATO["logins"] == 1           # due ricerche vicine, un login solo
+    assert "sessione da riaprire" not in str(main.STATO)
     assert client.get("/stato").json()["sessione_aperta"] is True
     time.sleep(2.5)
     assert STATO["logouts"] == 1 and STATO["attiva"] is None
@@ -226,11 +252,58 @@ def test_ricerca_sconosciuta(client):
 
 
 def test_esce_alla_chiusura():
-    fake_sister.azzera()
-    main.LAVORI.clear()
-    main.STATO.update(blocco=None)
-    main.LAVORATORE = main.Lavoratore()
+    _nuovo(False)
     with TestClient(main.app) as c:
         cerca(c, **PART)
         assert STATO["attiva"] is not None
     assert STATO["attiva"] is None and STATO["logouts"] == 1
+
+
+# ---- sessione sempre aperta ----
+
+def test_sempre_aperta_entra_subito_e_resta(sempre):
+    assert attendi(lambda: STATO["attiva"] is not None)
+    assert STATO["logins"] == 1
+    pagine = STATO["pagine"]
+    time.sleep(3)                        # tre giri nel menu, nessuna uscita
+    assert STATO["pagine"] > pagine and STATO["logouts"] == 0 and STATO["logins"] == 1
+    j = cerca(sempre, **PART, subalterno="26")
+    assert j["stato"] == "completata", j["errore"]
+    assert STATO["logins"] == 1
+    st = sempre.get("/stato").json()
+    assert st["sessione_aperta"] and st["sempre_aperta"] and st["ultimo_keepalive"]
+
+
+def test_sempre_aperta_rientra_se_sister_la_chiude(sempre):
+    assert attendi(lambda: STATO["attiva"] is not None)
+    STATO["attiva"] = None               # SISTER chiude la sessione senza dire niente
+    assert attendi(lambda: STATO["logins"] >= 2 and STATO["attiva"] is not None), (STATO["logins"], STATO["attiva"])
+    j = cerca(sempre, **PART)
+    assert j["stato"] == "completata", j["errore"]
+
+
+def test_sempre_aperta_utenza_occupata_poi_libera(sempre):
+    assert attendi(lambda: STATO["attiva"] is not None)
+    STATO.update(attiva=None, occupata=True)
+    time.sleep(2.5)
+    assert STATO["attiva"] is None
+    STATO["occupata"] = False
+    assert attendi(lambda: STATO["attiva"] is not None)
+
+
+def test_sempre_aperta_esce_alla_chiusura():
+    _nuovo(True)
+    with TestClient(main.app):
+        assert attendi(lambda: STATO["attiva"] is not None)
+    assert STATO["attiva"] is None and STATO["logouts"] == 1
+
+
+def test_sempre_aperta_ricerche_di_seguito_senza_rientrare(sempre):
+    assert attendi(lambda: STATO["attiva"] is not None)
+    a = cerca(sempre, **PART, subalterno="26")
+    b = cerca(sempre, tipo="particella", provincia="RM", comune="Roma", foglio="1", particella="1")   # altro ufficio
+    c = cerca(sempre, **PART, subalterno="1")                                                        # di nuovo Milano
+    time.sleep(2.5)                      # giri nel menu partendo dalle pagine delle visure
+    d = cerca(sempre, tipo="soggetto", provincia="MI", cognome="Monte")
+    assert [x["stato"] for x in (a, b, c, d)] == ["completata"] * 4, [x["errore"] for x in (a, b, c, d)]
+    assert STATO["logins"] == 1 and STATO["logouts"] == 0

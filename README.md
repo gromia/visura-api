@@ -6,9 +6,12 @@ Servizio interno di Gromia che fa le ricerche catastali su SISTER (Agenzia delle
 
 ## Come funziona
 
-- **Una sessione SISTER per volta.** SISTER permette una sola sessione per utenza. Il servizio entra alla
-  prima ricerca, fa le ricerche in coda una dopo l'altra ed esce `IDLE_SECONDI` dopo l'ultima (60 secondi).
-  Tra una ricerca e l'altra l'utenza è libera: chi entra a mano su SISTER non resta chiuso fuori.
+- **Sessione SISTER sempre aperta.** SISTER permette una sola sessione per utenza. Il servizio entra
+  all'avvio e resta dentro: ogni `KEEPALIVE_SECONDI` (180) ripassa dal menu perché la sessione non scada, e
+  se SISTER la chiude rientra da solo (riprova ogni 30 secondi finché non ci riesce). Le ricerche partono
+  subito, una alla volta. Conseguenza: con la stessa utenza nessuno può entrare a mano su SISTER; per l'uso
+  manuale serve un'altra utenza. Con `SESSIONE_SEMPRE_APERTA=0` il servizio entra solo per le ricerche ed
+  esce `IDLE_SECONDI` (60) dopo l'ultima.
 - **Stesso percorso di gromia/sister-parser**, il crawler in produzione: pagina unica dell'Agenzia (scheda
   Sister), informativa privacy, Consultazioni e Certificazioni > Visure catastali > Conferma Lettura >
   convenzione (`SISTER_CONVENZIONE`, GROMIA) > ufficio provinciale, poi la ricerca dal menu.
@@ -36,12 +39,13 @@ per il soggetto anche `soggetti` e, in ogni immobile, `soggetto`. Gli intestati 
 `MAX_INTESTATI` unità (40). Le ricerche restano in memoria `CONSERVA_ORE` (24): lo storico è nel sito.
 Una ricerca sconosciuta (servizio riavviato) risponde 404.
 
-`GET /stato`: credenziali presenti, sessione aperta, ricerche in coda, eventuale blocco e ultimo errore.
+`GET /stato`: credenziali presenti, sessione aperta (da quando, ultimo giro nel menu, quanti rientri), ricerche in
+coda, eventuale blocco e ultimo errore.
 
 ## Variabili
 
 `SISTER_USERNAME`, `SISTER_PASSWORD` (le inserisce l'utente su Railway). Facoltative: `SISTER_CONVENZIONE`,
-`IDLE_SECONDI`, `TEMPO_MAX_RICERCA`, `ATTESA_UTENZA_OCCUPATA`, `PAUSA_UTENZA_OCCUPATA`, `MAX_INTESTATI`,
+`SESSIONE_SEMPRE_APERTA`, `KEEPALIVE_SECONDI`, `IDLE_SECONDI`, `TEMPO_MAX_RICERCA`, `ATTESA_UTENZA_OCCUPATA`, `PAUSA_UTENZA_OCCUPATA`, `MAX_INTESTATI`,
 `CONSERVA_ORE`. `VISURA_SELFTEST` (JSON di una ricerca, o un elenco) la esegue all'avvio e scrive nei log solo la forma del
 risultato (colonne e numeri, mai nomi), per controllare il servizio dopo un rilascio.
 
