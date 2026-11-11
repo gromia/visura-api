@@ -1,848 +1,351 @@
+"""visura-api: ricerche catastali su SISTER per la dashboard di Gromia.
+
+POST /ricerche mette in coda una ricerca (particella, indirizzo o soggetto) e risponde subito con il suo id;
+GET /ricerche/{id} ne dà lo stato ("in coda", "in corso" con la fase, "completata" con il risultato, "errore"
+con il motivo); GET /stato dice se il servizio è pronto. Il servizio si raggiunge solo dalla rete privata di
+Railway (dal sito, VISURA_URL), senza dominio pubblico.
+
+SISTER consente una sola sessione per utenza, quindi le ricerche passano da un solo lavoratore, una alla
+volta. La sessione si apre alla prima ricerca e si chiude IDLE_SECONDI dopo l'ultima: tra una ricerca e
+l'altra l'utenza resta libera anche per chi entra a mano. Se SISTER chiude la sessione a metà, il lavoratore
+rientra e ripete la ricerca una volta; se l'utenza è aperta altrove aspetta e riprova; se SISTER rifiuta le
+credenziali smette di provarci (altri tentativi bloccherebbero l'utenza) finché non si riavvia il servizio.
+"""
+from __future__ import annotations
+
 import asyncio
-import logging
-import sys
 import json
+import logging
 import os
-from datetime import datetime
-from typing import Optional, Dict
-from dataclasses import dataclass
 import time
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import JSONResponse
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+import traceback
+import uuid
 from contextlib import asynccontextmanager
-import utils
-from urllib.parse import urlparse
-from utils import CredenzialiErrate, login, run_visura, logout, extract_all_sezioni, run_visura_immobile, explore_sister, run_ricerca_soggetto, run_ricerca_indirizzo
-from pydantic import BaseModel, Field, validator
+from typing import Literal, Optional, Union
 
-# Configurazione logging
-log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+from fastapi import FastAPI, HTTPException
+from playwright.async_api import Error as PWError, TimeoutError as PWTimeout, async_playwright
+from pydantic import BaseModel, ConfigDict, Field
 
-# Create logs directory if it doesn't exist and we have permission
-log_handlers = [logging.StreamHandler()]
-try:
-    if not os.path.exists('./logs'):
-        os.makedirs('./logs', exist_ok=True)
-    log_handlers.append(logging.FileHandler('./logs/visura.log'))
-except (PermissionError, OSError) as e:
-    print(f"Warning: Cannot create log file: {e}")
+import sister
 
-logging.basicConfig(
-    level=getattr(logging, log_level),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=log_handlers
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("visura")
 
-# Custom Exception Classes
-class VisuraError(Exception):
-    """Base exception for visura-related errors"""
-    pass
+USERNAME = os.environ.get("SISTER_USERNAME", "")
+PASSWORD = os.environ.get("SISTER_PASSWORD", "")
+IDLE_SECONDI = float(os.environ.get("IDLE_SECONDI", "60"))               # sessione aperta dopo l'ultima ricerca
+TEMPO_MAX = float(os.environ.get("TEMPO_MAX_RICERCA", "420"))            # una ricerca, intestati compresi
+ATTESA_OCCUPATA = float(os.environ.get("ATTESA_UTENZA_OCCUPATA", "480"))  # quanto aspettare l'utenza libera
+PAUSA_OCCUPATA = float(os.environ.get("PAUSA_UTENZA_OCCUPATA", "30"))
+MAX_INTESTATI = int(os.environ.get("MAX_INTESTATI", "40"))
+CONSERVA_ORE = float(os.environ.get("CONSERVA_ORE", "24"))
+CHROMIUM_PATH = os.environ.get("CHROMIUM_PATH") or None
+MOTIVO = "Verifica della titolarità per un incarico di intermediazione immobiliare"
 
-class AuthenticationError(VisuraError):
-    """Raised when authentication fails"""
-    pass
 
-class BrowserError(VisuraError):
-    """Raised when browser operations fail"""
-    pass
+# ---- richieste ------------------------------------------------------------------------------------
 
-class ValidationError(VisuraError):
-    """Raised when input validation fails"""
-    pass
+class Base(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    provincia: str = Field(..., min_length=2, max_length=60)
+    comune: str = Field("", max_length=80)
 
-@dataclass
-class VisuraRequest:
-    request_id: str
-    tipo_catasto: str
-    provincia: str
-    comune: str
-    foglio: str
-    particella: str
-    sezione: Optional[str] = None
-    subalterno: Optional[str] = None
-    timestamp: datetime = None
-    
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.now()
 
-@dataclass
-class VisuraIntestatiRequest:
-    """Richiesta per ottenere gli intestati di un immobile specifico"""
-    request_id: str
-    tipo_catasto: str
-    provincia: str
-    comune: str
-    foglio: str
-    particella: str
-    subalterno: Optional[str] = None
-    sezione: Optional[str] = None
-    timestamp: datetime = None
-    
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.now()
+class Particella(Base):
+    tipo: Literal["particella"]
+    comune: str = Field(..., min_length=1, max_length=80)
+    foglio: str = Field(..., pattern=r"^[0-9A-Za-z]{1,10}$")
+    particella: str = Field(..., pattern=r"^[0-9A-Za-z]{1,10}$")
+    sezione: str = Field("", pattern=r"^[0-9A-Za-z]{0,6}$")
+    subalterno: str = Field("", pattern=r"^[0-9A-Za-z]{0,10}$")
+    catasto: Literal["F", "T", "E"] = "F"
 
-@dataclass
-class RicercaRequest:
-    """Ricerca per soggetto (persona fisica o giuridica) o per indirizzo: i campi del modulo SISTER in params"""
-    request_id: str
-    tipo: str  # "soggetto" o "indirizzo"
-    params: Dict
 
-@dataclass
-class VisuraResponse:
-    request_id: str
-    success: bool
-    tipo_catasto: str
-    data: Optional[Dict] = None
-    error: Optional[str] = None
-    timestamp: datetime = None
-    
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.now()
+class Indirizzo(Base):
+    tipo: Literal["indirizzo"]
+    comune: str = Field(..., min_length=1, max_length=80)
+    indirizzo: str = Field(..., min_length=2, max_length=120)
+    toponimo: str = Field("", max_length=30)
+    civico: str = Field("", pattern=r"^[0-9A-Za-z/]{0,10}$")
+    catasto: Literal["F", "T"] = "F"
 
-class BrowserManager:
+
+class Soggetto(Base):
+    tipo: Literal["soggetto"]
+    tipo_soggetto: Literal["PF", "PNF"] = "PF"
+    cognome: str = Field("", max_length=60)
+    nome: str = Field("", max_length=60)
+    codice_fiscale: str = Field("", pattern=r"^[0-9A-Za-z]{0,16}$")
+    denominazione: str = Field("", max_length=120)
+    catasto: Literal["F", "T", "E"] = "E"
+    richiedente: str = Field("", max_length=60)
+    motivo: str = Field("", max_length=100)
+
+
+Richiesta = Union[Particella, Indirizzo, Soggetto]
+
+
+class Corpo(BaseModel):
+    ricerca: Richiesta = Field(..., discriminator="tipo")
+
+
+# ---- lavori ---------------------------------------------------------------------------------------
+
+class Lavoro:
+    def __init__(self, r: Richiesta):
+        self.id = uuid.uuid4().hex
+        self.richiesta = r
+        self.stato = "in coda"
+        self.fase = ""
+        self.risultato: Optional[dict] = None
+        self.errore: Optional[str] = None
+        self.creato = time.time()
+        self.finito: Optional[float] = None
+
+    def json(self) -> dict:
+        return {"id": self.id, "tipo": self.richiesta.tipo, "stato": self.stato, "fase": self.fase,
+                "posizione": _posizione(self), "risultato": self.risultato, "errore": self.errore,
+                "creato": self.creato, "finito": self.finito}
+
+
+LAVORI: dict[str, Lavoro] = {}
+STATO = {"sessione": False, "blocco": None, "ultimo_errore": None, "ultima_ricerca": None}
+
+
+def _pulisci_vecchi():
+    limite = time.time() - CONSERVA_ORE * 3600
+    for k in [k for k, v in LAVORI.items() if v.finito and v.finito < limite]:
+        del LAVORI[k]
+
+
+def _posizione(l: Lavoro) -> Optional[int]:
+    if l.stato != "in coda":
+        return None
+    in_coda = sorted((x for x in LAVORI.values() if x.stato == "in coda"), key=lambda x: x.creato)
+    return next((i + 1 for i, x in enumerate(in_coda) if x.id == l.id), None)
+
+
+# ---- lavoratore -----------------------------------------------------------------------------------
+
+class Lavoratore:
     def __init__(self):
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
-        self.auth_page: Optional[Page] = None
-        self.authenticated = False
-        self.keep_alive_running = False
-        self.last_login_time = None
-        self.login_lock = asyncio.Lock()
-        # una sola cosa alla volta sulla scheda di SISTER: richieste e refresh della sessione non si sovrappongono
-        self.page_lock = asyncio.Lock()
-        # dopo "Credenziali errate" non si riprova più fino al riavvio: troppi tentativi bloccano l'utenza Sister
-        self.credenziali_errate = False
+        self.coda: "asyncio.Queue[Lavoro]" = asyncio.Queue()
+        self.pw = None
+        self.browser = None
+        self.sessione: Optional[sister.Sessione] = None
 
-    async def initialize(self):
-        """Inizializza il browser e il contexto"""
-        try:
-            playwright = await async_playwright().start()
-            self.browser = await playwright.chromium.launch(
-                headless=True,  
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--single-process',
-                    '--disable-extensions'
-                ]
-            )
-            
-            self.context = await self.browser.new_context()
-            logger.info("Browser inizializzato")
-        except Exception as e:
-            logger.error(f"Failed to initialize browser: {e}")
-            raise BrowserError(f"Browser initialization failed: {e}") from e
-        
-    async def login(self):
-        """Esegue il login in una scheda nuova. Un login alla volta: lo chiedono sia l'avvio sia le richieste."""
-        async with self.login_lock:
-            if self.credenziali_errate:
-                raise AuthenticationError("Credenziali Sister errate: aggiorna SISTER_USERNAME e SISTER_PASSWORD su Railway")
-            if self.authenticated and await self._check_session_validity():
-                return
-            await self._login_page()
+    async def avvia(self):
+        self.pw = await async_playwright().start()
 
-    async def _login_page(self):
-        try:
-            if self.auth_page and not self.auth_page.is_closed():
-                await self.auth_page.close()
-            # la scheda diventa subito quella di lavoro: se il login fallisce, il tentativo successivo la chiude
-            page = self.auth_page = await self.context.new_page()
-            await login(page)
-            self.authenticated = True
-            self.last_login_time = datetime.now()
-            logger.info("Login completato con successo")
-        except Exception as e:
-            logger.error(f"Errore durante il login: {e}")
-            self.authenticated = False
-            if isinstance(e, CredenzialiErrate):
-                self.credenziali_errate = True
-            raise AuthenticationError(f"Login failed: {e}") from e
+    async def _browser(self):
+        if self.browser is None or not self.browser.is_connected():
+            self.browser = await self.pw.chromium.launch(
+                headless=True, executable_path=CHROMIUM_PATH, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        return self.browser
 
-    async def start_keep_alive(self):
-        """Mantiene la sessione attiva con attività realistiche (un solo worker, anche dopo un nuovo login)"""
-        if self.keep_alive_running:
-            return
-        self.keep_alive_running = True
-        
-        async def keep_alive_worker():
-            last_check = datetime.now()
-            while self.keep_alive_running:
-                try:
-                    if self.auth_page and not self.auth_page.is_closed():
-                        current_time = datetime.now()
-                        
-                        # Ogni 5 minuti, fai una verifica più approfondita
-                        if (current_time - last_check).total_seconds() > 300:
-                            await self._perform_session_refresh()
-                            last_check = current_time
-                        else:
-                            # Keep-alive leggero ogni 30 secondi
-                            await self._perform_light_keepalive()
-                    
-                    await asyncio.sleep(30)
-                    
-                except Exception as e:
-                    logger.error(f"Errore in keep-alive: {e}")
-                    await asyncio.sleep(60)
-        
-        asyncio.create_task(keep_alive_worker())
-    
-    async def _perform_light_keepalive(self):
-        """Keep-alive leggero: movimento del mouse"""
-        try:
-            await self.auth_page.mouse.move(100, 100)
-            await asyncio.sleep(0.1)
-            await self.auth_page.mouse.move(200, 200)
-            logger.debug("Keep-alive movimento mouse eseguito")
-        except Exception as e:
-            logger.warning(f"Errore in light keep-alive: {e}")
-    
-    async def _perform_session_refresh(self):
-        """Refresh della sessione: riapre la scelta della provincia dal menu di SISTER. Se una richiesta sta usando
-        la scheda si salta il giro: la richiesta stessa tiene viva la sessione."""
-        if self.page_lock.locked():
-            return True
-        async with self.page_lock:
+    async def chiudi_sessione(self):
+        if self.sessione:
             try:
-                logger.info("Eseguendo refresh della sessione...")
-                await utils.apri_scelta(self.auth_page, forza=True)
-                n = await self.auth_page.locator("select[name='listacom'] option").count()
-                logger.info(f"Session refresh completato - {n-1} province disponibili")
-                return True
+                await self.sessione.chiudi()
             except Exception as e:
-                logger.warning(f"Sessione scaduta durante refresh: {e}")
-                self.authenticated = False
-                return False
+                log.warning("chiusura della sessione: %s", type(e).__name__)
+        self.sessione = None
+        STATO["sessione"] = False
 
-    async def stop_keep_alive(self):
-        """Ferma il keep-alive"""
-        self.keep_alive_running = False
-    
-    async def _check_session_validity(self):
-        """Verifica se la sessione è ancora valida"""
-        try:
-            if not self.auth_page or self.auth_page.is_closed():
-                logger.warning("Pagina di autenticazione non disponibile")
-                return False
-            
-            current_url = self.auth_page.url
-            if not utils.SISTER_HOST_RE.match(urlparse(current_url).hostname or ""):
-                logger.warning(f"Non siamo più nel portale SISTER - URL: {current_url}")
-                return False
-            
-            if not await utils.ha_scelta_provincia(self.auth_page):
-                await utils.apri_scelta(self.auth_page)
-            
-            provincia_options = await self.auth_page.locator("select[name='listacom'] option").count()
-            if provincia_options <= 1:
-                logger.warning("Province non disponibili - sessione probabilmente scaduta")
-                return False
-                
-            logger.info(f"Sessione valida - {provincia_options-1} province disponibili")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Errore nella verifica della sessione: {e}")
-            return False
-    
-    async def _ensure_authenticated(self):
-        """Assicura che il sistema sia autenticato, ri-autentica se necessario"""
-        if not self.authenticated or not await self._check_session_validity():
-            logger.info("Sessione non valida, ri-autenticando...")
-            try:
-                try:
-                    await self.login()
-                except Exception as e:
-                    if self.credenziali_errate:
-                        raise
-                    # SISTER a volte è lento a caricare il menu: un secondo tentativo di solito basta
-                    logger.warning(f"Login non riuscito, riprovo: {e}")
-                    await self.login()
-                await self.start_keep_alive()
-                logger.info("Re-autenticazione completata")
-            except Exception as e:
-                logger.error(f"Errore nella re-autenticazione: {e}")
-                raise AuthenticationError(f"Re-authentication failed: {e}") from e
-
-    async def _run_sessione(self, fn):
-        """Esegue fn() con la scheda di SISTER tutta per sé (niente refresh in mezzo)"""
-        async with self.page_lock:
-            return await self._run_sessione_unlocked(fn)
-
-    async def _run_sessione_unlocked(self, fn):
-        """Esegue fn(); se SISTER dice che la sessione è scaduta rifà il login e ripete una volta"""
-        await self._ensure_authenticated()
-        try:
-            return await fn()
-        except Exception as e:
-            if not any(k in str(e).lower() for k in ("scadut", "sessione_scaduta", "error_locked", "in sessione")):
-                raise
-            logger.warning(f"Sessione SISTER scaduta durante la richiesta, nuovo login e nuovo tentativo: {e}")
-            self.authenticated = False
-            await self._ensure_authenticated()
-            return await fn()
-
-    async def esegui_visura(self, request: VisuraRequest) -> VisuraResponse:
-        """Esegue una visura catastale"""
-        try:
-            try:
-                # Per i terreni estraiamo sempre gli intestati, per i fabbricati no
-                extract_intestati = request.tipo_catasto == 'T'
-                
-                result = await self._run_sessione(lambda: run_visura(
-                    self.auth_page,
-                    request.provincia,
-                    request.comune,
-                    request.sezione,
-                    request.foglio,
-                    request.particella,
-                    request.tipo_catasto,
-                    extract_intestati
-                ))
-            except AuthenticationError:
-                raise
-            except Exception as e:
-                raise BrowserError(f"Failed to execute visura: {e}") from e
-            
-            logger.info(f"Visura completata per request {request.request_id}")
-            return VisuraResponse(
-                request_id=request.request_id,
-                success=True,
-                tipo_catasto=request.tipo_catasto,
-                data=result,
-            )
-            
-        except (AuthenticationError, BrowserError) as e:
-            logger.error(f"Errore in visura {request.request_id}: {e}")
-            return VisuraResponse(
-                request_id=request.request_id,
-                success=False,
-                tipo_catasto=request.tipo_catasto,
-                error=str(e),
-            )
-        except Exception as e:
-            logger.error(f"Errore inatteso in visura {request.request_id}: {e}")
-            return VisuraResponse(
-                request_id=request.request_id,
-                success=False,
-                tipo_catasto=request.tipo_catasto,
-                error=f"Errore inatteso: {str(e)}",
-            )
-
-    async def esegui_ricerca(self, request: RicercaRequest) -> VisuraResponse:
-        """Ricerca per soggetto o per indirizzo: il risultato sono le tabelle della pagina SISTER"""
-        tipo_catasto = request.params.get("tipo_catasto", "")
-        try:
-            run = run_ricerca_soggetto if request.tipo == "soggetto" else run_ricerca_indirizzo
-            result = await self._run_sessione(lambda: run(self.auth_page, **request.params))
-            return VisuraResponse(request_id=request.request_id, success=True, tipo_catasto=tipo_catasto, data=result)
-        except Exception as e:
-            logger.error(f"Errore in ricerca {request.tipo} {request.request_id}: {e}")
-            return VisuraResponse(request_id=request.request_id, success=False, tipo_catasto=tipo_catasto, error=str(e))
-
-    async def esegui_visura_intestati(self, request: VisuraIntestatiRequest) -> VisuraResponse:
-        """Esegue una visura per ottenere gli intestati di un immobile specifico."""
-        try:
-            if request.tipo_catasto == 'F' and request.subalterno:
-                result = await self._run_sessione(lambda: run_visura_immobile(
-                    self.auth_page,
-                    provincia=request.provincia,
-                    comune=request.comune,
-                    sezione=request.sezione,
-                    foglio=request.foglio,
-                    particella=request.particella,
-                    subalterno=request.subalterno
-                ))
-            else:
-                result = await self._run_sessione(lambda: run_visura(
-                    self.auth_page,
-                    request.provincia,
-                    request.comune,
-                    request.sezione,
-                    request.foglio,
-                    request.particella,
-                    request.tipo_catasto,
-                    extract_intestati=True
-                ))
-            
-            logger.info(f"Visura intestati completata per {request.request_id}")
-            return VisuraResponse(
-                request_id=request.request_id,
-                success=True,
-                tipo_catasto=request.tipo_catasto,
-                data=result,
-            )
-            
-        except Exception as e:
-            logger.error(f"Errore in visura intestati {request.request_id}: {e}")
-            return VisuraResponse(
-                request_id=request.request_id,
-                success=False,
-                tipo_catasto=request.tipo_catasto,
-                error=str(e),
-            )
-
-    async def restart_browser_if_needed(self):
-        """Riavvia il browser se necessario"""
-        try:
-            if self.browser and not self.browser.is_connected():
-                logger.info("Browser disconnesso, riavviando...")
-                await self.close()
-                await self.initialize()
-                await self.login()
-                await self.start_keep_alive()
-                logger.info("Browser riavviato con successo")
-        except Exception as e:
-            logger.error(f"Errore nel riavvio browser: {e}")
-            raise BrowserError(f"Failed to restart browser: {e}") from e
-
-    async def close(self):
-        """Chiude il browser e torna sempre al portale"""
-        await self.stop_keep_alive()
-        try:
-            if self.auth_page and not self.auth_page.is_closed():
-                try:
-                    await self.auth_page.get_by_role("link", name=" Torna al portale").click()
-                except Exception as e:
-                    logger.warning(f"Impossibile cliccare 'Torna al portale': {e}")
-        except Exception as e:
-            logger.warning(f"Errore durante il tentativo di tornare al portale: {e}")
-        try:
-            if self.context:
-                await self.context.close()
-        except Exception as e:
-            logger.warning(f"Errore durante la chiusura del context: {e}")
+    async def ferma(self):
+        await self.chiudi_sessione()
         try:
             if self.browser:
                 await self.browser.close()
-        except Exception as e:
-            logger.warning(f"Errore durante la chiusura del browser: {e}")
-        logger.info("Browser chiuso")
+            if self.pw:
+                await self.pw.stop()
+        except Exception:
+            pass
 
-    async def graceful_shutdown(self):
-        """Effettua uno shutdown graceful con logout"""
-        logger.info("Iniziando shutdown graceful...")
-        
-        try:
-            if self.auth_page and not self.auth_page.is_closed():
-                logger.info("Effettuando logout dalla sessione...")
-                await logout(self.auth_page)
-        except Exception as e:
-            logger.warning(f"Errore durante il logout: {e}")
-        
-        await self.close()
-        logger.info("Shutdown graceful completato")
-
-class VisuraService:
-    def __init__(self):
-        self.browser_manager = BrowserManager()
-        self.request_queue = asyncio.Queue()
-        self.response_store: Dict[str, VisuraResponse] = {}
-        self.processing = False
-        
-    async def initialize(self):
-        """Inizializza il servizio"""
-        await self.browser_manager.initialize()
-        try:
-            await self._after_login()
-        except AuthenticationError as e:
-            # SISTER accetta una sessione alla volta: dopo un riavvio la copia precedente può restare collegata
-            # per qualche minuto. Il servizio parte lo stesso e, con le credenziali Sister, riprova da solo.
-            # Con lo SPID no: ogni tentativo manda una notifica sul telefono.
-            logger.error(f"Login all'avvio non riuscito: {e}")
-            if os.getenv("SISTER_USERNAME"):
-                asyncio.create_task(self._login_retry())
-        
-        # Avvia il worker per processare le richieste
-        asyncio.create_task(self._process_requests())
-        
-    async def _after_login(self):
-        await self.browser_manager.login()
-        if os.getenv("VISURA_EXPLORE"):
-            # ricognizione una tantum dei moduli SISTER (soggetto, indirizzo): nessuna ricerca, solo i campi nei log
+    async def _entra(self, l: Lavoro):
+        """Apre la sessione se non è aperta. Con l'utenza occupata aspetta e riprova fino ad ATTESA_OCCUPATA."""
+        if self.sessione and self.sessione.aperta:
+            return
+        if STATO["blocco"]:
+            raise sister.LoginRifiutato(STATO["blocco"])
+        inizio = time.monotonic()
+        while True:
+            self.sessione = sister.Sessione(await self._browser(), USERNAME, PASSWORD)
+            self.sessione.fase = lambda f: setattr(l, "fase", f)
             try:
-                await explore_sister(self.browser_manager.auth_page, os.getenv("VISURA_EXPLORE"))
-            except Exception as e:
-                logger.error(f"Ricognizione SISTER non riuscita: {e}")
-        await self.browser_manager.start_keep_alive()
-
-    async def _login_retry(self):
-        for attempt in range(1, 61):
-            await asyncio.sleep(60)
-            if self.browser_manager.authenticated or self.browser_manager.credenziali_errate:
+                await self.sessione.apri()
+                STATO["sessione"] = True
                 return
+            except sister.UtenzaOccupata:
+                await self.chiudi_sessione()
+                if time.monotonic() - inizio + PAUSA_OCCUPATA > ATTESA_OCCUPATA:
+                    raise sister.UtenzaOccupata(
+                        "L'utenza SISTER è in uso da un'altra parte (qualcuno collegato a mano o un altro programma) "
+                        f"da più di {max(1, int(ATTESA_OCCUPATA // 60))} minuti: chi la usa deve uscire con \"Esci\", "
+                        "poi ripeti la ricerca.")
+                l.fase = f"Utenza SISTER occupata altrove: riprovo tra {int(PAUSA_OCCUPATA)} secondi"
+                log.info("utenza occupata, nuovo tentativo tra %ss", PAUSA_OCCUPATA)
+                await asyncio.sleep(PAUSA_OCCUPATA)
+            except sister.LoginRifiutato as e:
+                STATO["blocco"] = str(e)
+                await self.chiudi_sessione()
+                raise
+            except BaseException:
+                await self.chiudi_sessione()
+                raise
+
+    async def esegui(self, l: Lavoro):
+        l.stato = "in corso"
+        r = l.richiesta
+        log.info("ricerca %s %s", l.id[:8], r.tipo)
+        for tentativo in (1, 2):
             try:
-                await self._after_login()
-                logger.info(f"Login riuscito al tentativo {attempt + 1}")
+                await self._entra(l)
+                self.sessione.fase = lambda f: setattr(l, "fase", f)
+                l.risultato = await asyncio.wait_for(_ricerca(self.sessione, r), timeout=TEMPO_MAX)
+                l.stato, l.fase = "completata", ""
+                log.info("ricerca %s completata: %d immobili", l.id[:8], len(l.risultato.get("immobili", [])))
                 return
+            except sister.NonTrovato as e:
+                l.stato, l.errore = "errore", str(e)
+                return
+            except (sister.LoginRifiutato, sister.UtenzaOccupata) as e:
+                l.stato, l.errore = "errore", str(e)
+                await self.chiudi_sessione()
+                return
+            except asyncio.TimeoutError:
+                await self.chiudi_sessione()
+                l.stato = "errore"
+                l.errore = "SISTER è troppo lento in questo momento: la ricerca ha superato il tempo massimo. Riprova tra qualche minuto."
+                return
+            except (sister.SessionePersa, PWTimeout, PWError) as e:
+                motivo = str(e) if isinstance(e, sister.SisterError) else type(e).__name__
+                log.warning("ricerca %s, tentativo %d: %s", l.id[:8], tentativo, motivo[:300])
+                await self.chiudi_sessione()
+                if tentativo == 2:
+                    l.stato = "errore"
+                    l.errore = f"SISTER non ha risposto come previsto anche al secondo tentativo ({motivo[:160]}). Riprova tra qualche minuto."
+                    return
+                l.fase = "SISTER ha chiuso la sessione: rientro e ripeto la ricerca"
             except Exception as e:
-                logger.error(f"Login non riuscito (tentativo {attempt + 1}): {e}")
+                log.error("ricerca %s: errore imprevisto %s\n%s", l.id[:8], type(e).__name__, traceback.format_exc()[-1500:])
+                await self.chiudi_sessione()
+                l.stato, l.errore = "errore", f"Errore imprevisto del servizio visure ({type(e).__name__}): riprova."
+                return
 
-    async def _process_requests(self):
-        """Processa le richieste in coda"""
-        self.processing = True
-        
-        while self.processing:
+    async def ciclo(self):
+        while True:
             try:
-                request_data = await self.request_queue.get()
-                request = request_data['request']
-                
-                if isinstance(request, VisuraRequest):
-                    response = await self.browser_manager.esegui_visura(request)
-                    self.response_store[request.request_id] = response
-                    logger.info(f"Processata richiesta visura {request.request_id}")
-                
-                elif isinstance(request, RicercaRequest):
-                    response = await self.browser_manager.esegui_ricerca(request)
-                    self.response_store[request.request_id] = response
-                    logger.info(f"Processata ricerca {request.tipo} {request.request_id}")
+                l = await asyncio.wait_for(self.coda.get(), timeout=IDLE_SECONDI if self.sessione else None)
+            except asyncio.TimeoutError:
+                log.info("nessuna ricerca da %ss: esco da SISTER", int(IDLE_SECONDI))
+                await self.chiudi_sessione()
+                continue
+            try:
+                await self.esegui(l)
+            finally:
+                l.finito = time.time()
+                if l.stato == "errore":
+                    STATO["ultimo_errore"] = {"quando": l.finito, "errore": l.errore}
+                STATO["ultima_ricerca"] = {"quando": l.finito, "stato": l.stato}
+                _pulisci_vecchi()
 
-                elif isinstance(request, VisuraIntestatiRequest):
-                    response = await self.browser_manager.esegui_visura_intestati(request)
-                    self.response_store[request.request_id] = response
-                    logger.info(f"Processata richiesta intestati {request.request_id}")
-                
-                else:
-                    logger.error(f"Tipo di richiesta sconosciuto: {type(request)}")
-                
-                self.request_queue.task_done()
-                
-                # Pausa tra le richieste per non sovraccaricare SISTER
-                await asyncio.sleep(0.5)
-                
-            except Exception as e:
-                logger.error(f"Errore nel processare richieste: {e}")
-                await asyncio.sleep(5)
-    
-    async def add_request(self, request: VisuraRequest) -> str:
-        """Aggiunge una richiesta alla coda"""
-        await self.request_queue.put({'request': request})
-        logger.info(f"Richiesta visura {request.request_id} aggiunta alla coda (posizione: {self.request_queue.qsize()})")
-        return request.request_id
-    
-    async def add_intestati_request(self, request: VisuraIntestatiRequest) -> str:
-        """Aggiunge una richiesta intestati alla coda"""
-        await self.request_queue.put({'request': request})
-        logger.info(f"Richiesta intestati {request.request_id} aggiunta alla coda (posizione: {self.request_queue.qsize()})")
-        return request.request_id
-    
-    async def get_response(self, request_id: str) -> Optional[VisuraResponse]:
-        """Ottiene la risposta per un request_id"""
-        return self.response_store.get(request_id)
-    
-    async def shutdown(self):
-        """Chiude il servizio"""
-        self.processing = False
-        await self.browser_manager.close()
-    
-    async def graceful_shutdown(self):
-        """Chiude il servizio con logout graceful"""
-        logger.info("Iniziando graceful shutdown del servizio...")
-        self.processing = False
-        await self.browser_manager.graceful_shutdown()
-        logger.info("Graceful shutdown del servizio completato")
 
-# Global service instance - initialized during lifespan
-visura_service: Optional[VisuraService] = None
+async def _ricerca(s: sister.Sessione, r: Richiesta) -> dict:
+    if isinstance(r, Particella):
+        out = {"immobili": [], "avvisi": []}
+        for c in (["F", "T"] if r.catasto == "E" else [r.catasto]):
+            if r.subalterno and c == "T":
+                continue
+            x = await sister.cerca_particella(s, r.provincia, r.comune, r.foglio, r.particella, r.sezione,
+                                              r.subalterno, c, MAX_INTESTATI)
+            out["immobili"] += x["immobili"]
+            out["avvisi"] += x["avvisi"]
+        return out
+    if isinstance(r, Indirizzo):
+        return await sister.cerca_indirizzo(s, r.provincia, r.comune, r.indirizzo, r.toponimo, r.civico,
+                                            r.catasto, MAX_INTESTATI)
+    return await sister.cerca_soggetto(s, r.provincia, r.comune, r.tipo_soggetto, r.cognome, r.nome,
+                                       r.codice_fiscale.upper(), r.denominazione, r.catasto, r.richiedente,
+                                       r.motivo or MOTIVO)
 
-def get_visura_service() -> VisuraService:
-    """Dependency to get the visura service"""
-    if visura_service is None:
-        raise HTTPException(status_code=503, detail="Servizio non inizializzato")
-    return visura_service
 
-# Signal handler per shutdown graceful
+# ---- app ------------------------------------------------------------------------------------------
+
+LAVORATORE = Lavoratore()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    # SIGTERM e SIGINT li gestisce uvicorn, che chiude questo lifespan: graceful_shutdown esce da SISTER prima che
-    # il processo finisca, così il riavvio successivo non trova la sessione ancora aperta
-    global visura_service
-    visura_service = VisuraService()
-    await visura_service.initialize()
-    logger.info("Servizio visure avviato")
-    yield
-    # Shutdown
-    if visura_service:
-        await visura_service.graceful_shutdown()
-    logger.info("Servizio visure fermato con graceful shutdown")
-
-# API FastAPI
-app = FastAPI(title="Servizio Visure Catastali", lifespan=lifespan)
-
-# ---------------------------------------------------------------------------
-# Modelli di richiesta
-# ---------------------------------------------------------------------------
-
-class VisuraInput(BaseModel):
-    """Richiesta per una visura catastale"""
-    provincia: str = Field(..., min_length=1, description="Nome della provincia")
-    comune: str = Field(..., min_length=1, description="Nome del comune")
-    foglio: str = Field(..., min_length=1, description="Numero di foglio")
-    particella: str = Field(..., min_length=1, description="Numero di particella")
-    sezione: Optional[str] = Field(None, description="Sezione (opzionale)")
-    tipo_catasto: Optional[str] = Field(None, pattern=r"^[TF]$", description="'T' = Terreni, 'F' = Fabbricati (se omesso esegue entrambi)")
-    
-    @validator('tipo_catasto')
-    def validate_tipo_catasto(cls, v):
-        if v is not None and v not in ['T', 'F']:
-            raise ValidationError(f"tipo_catasto deve essere 'T' o 'F', ricevuto {v}")
-        return v
-
-class VisuraIntestatiInput(BaseModel):
-    """Richiesta per ottenere gli intestati di un immobile specifico"""
-    provincia: str = Field(..., min_length=1, description="Nome della provincia")
-    comune: str = Field(..., min_length=1, description="Nome del comune")
-    foglio: str = Field(..., min_length=1, description="Numero di foglio")
-    particella: str = Field(..., min_length=1, description="Numero di particella")
-    tipo_catasto: str = Field(..., pattern=r"^[TF]$", description="'T' = Terreni, 'F' = Fabbricati")
-    subalterno: Optional[str] = Field(None, description="Numero di subalterno (obbligatorio per Fabbricati)")
-    sezione: Optional[str] = Field(None, description="Sezione (opzionale)")
-    
-    @validator('tipo_catasto')
-    def validate_tipo_catasto(cls, v):
-        if v not in ['T', 'F']:
-            raise ValidationError(f"tipo_catasto deve essere 'T' o 'F', ricevuto {v}")
-        return v
-    
-    @validator('subalterno')
-    def validate_subalterno(cls, v, values):
-        tipo_catasto = values.get('tipo_catasto')
-        if tipo_catasto == 'F' and not v:
-            raise ValidationError("subalterno è obbligatorio per i fabbricati (tipo_catasto='F')")
-        if tipo_catasto == 'T' and v:
-            raise ValidationError("subalterno non va indicato per i terreni (tipo_catasto='T')")
-        return v
-
-class SoggettoInput(BaseModel):
-    """Ricerca per soggetto: persona fisica (cognome e nome, oppure codice fiscale) o giuridica (denominazione, oppure CF/P.IVA)"""
-    provincia: str = Field(..., min_length=1)
-    comune: str = Field("", description="Vuoto = tutta la provincia")
-    tipo_catasto: str = Field("E", pattern=r"^[ETF]$", description="E = terreni e fabbricati")
-    tipo_soggetto: str = Field(..., pattern=r"^(PF|PNF)$")
-    cognome: str = ""
-    nome: str = ""
-    codice_fiscale: str = ""
-    denominazione: str = ""
-    richiedente: str = ""
-    motivo: str = ""
-
-class IndirizzoInput(BaseModel):
-    """Ricerca per indirizzo"""
-    provincia: str = Field(..., min_length=1)
-    comune: str = Field(..., min_length=1)
-    tipo_catasto: str = Field("F", pattern=r"^[TF]$")
-    toponimo: str = Field("", description="VIA, PIAZZA...; vuoto = tutti")
-    indirizzo: str = Field(..., min_length=1)
-    richiedente: str = ""
-    motivo: str = ""
-
-class SezioniExtractionRequest(BaseModel):
-    """Richiesta per l'estrazione delle sezioni territoriali"""
-    tipo_catasto: str = Field("T", pattern=r"^[TF]$", description="'T' = Terreni, 'F' = Fabbricati")
-    max_province: int = Field(200, ge=1, le=200, description="Numero massimo di province da processare (default: tutte)")
-
-# ---------------------------------------------------------------------------
-# Endpoint
-# ---------------------------------------------------------------------------
-
-@app.post("/visura")
-async def richiedi_visura(
-    request: VisuraInput, 
-    service: VisuraService = Depends(get_visura_service)
-):
-    """Richiede una visura catastale fornendo direttamente i dati catastali"""
+    await LAVORATORE.avvia()
+    compito = asyncio.create_task(LAVORATORE.ciclo())
+    prova = os.environ.get("VISURA_SELFTEST", "").strip()
+    if prova:
+        try:
+            l = Lavoro(Corpo(ricerca=json.loads(prova)).ricerca)
+            LAVORI[l.id] = l
+            await LAVORATORE.coda.put(l)
+            asyncio.create_task(_riassumi(l))
+        except Exception as e:
+            log.error("VISURA_SELFTEST non valido: %s", e)
+    log.info("servizio visure avviato (credenziali %s)", "presenti" if USERNAME and PASSWORD else "MANCANTI")
     try:
-        sezione = None if request.sezione == "_" else request.sezione
-        
-        tipos_catasto = [request.tipo_catasto] if request.tipo_catasto else ["T", "F"]
-        request_ids = []
-        
-        for tipo_catasto in tipos_catasto:
-            request_id = f"req_{tipo_catasto}_{int(time.time() * 1000)}"
-            visura_req = VisuraRequest(
-                request_id=request_id,
-                tipo_catasto=tipo_catasto,
-                provincia=request.provincia,
-                comune=request.comune,
-                sezione=sezione,
-                foglio=request.foglio,
-                particella=request.particella
-            )
-            await service.add_request(visura_req)
-            request_ids.append(request_id)
-        
-        return JSONResponse({
-            "request_ids": request_ids,
-            "tipos_catasto": tipos_catasto,
-            "status": "queued",
-            "message": f"Richieste aggiunte alla coda per {request.comune} F.{request.foglio} P.{request.particella}"
-        })
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Errore nella richiesta visura: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        yield
+    finally:
+        compito.cancel()
+        await LAVORATORE.ferma()
+        log.info("servizio visure fermato, sessione SISTER chiusa")
 
-@app.get("/visura/{request_id}")
-async def ottieni_visura(
-    request_id: str, 
-    service: VisuraService = Depends(get_visura_service)
-):
-    """Ottiene il risultato di una visura"""
-    try:
-        response = await service.get_response(request_id)
-        
-        if response is None:
-            return JSONResponse({
-                "request_id": request_id,
-                "status": "processing",
-                "message": "Richiesta in elaborazione"
-            })
-        
-        return JSONResponse({
-            "request_id": request_id,
-            "tipo_catasto": response.tipo_catasto,
-            "status": "completed" if response.success else "error",
-            "data": response.data,
-            "error": response.error,
-            "timestamp": response.timestamp.isoformat()
-        })
-        
-    except Exception as e:
-        logger.error(f"Errore nell'ottenere visura: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-async def _queue_ricerca(service, tipo: str, params: Dict):
-    request_id = f"{tipo}_{int(time.time() * 1000)}"
-    await service.request_queue.put({'request': RicercaRequest(request_id=request_id, tipo=tipo, params=params)})
-    return JSONResponse({"request_id": request_id, "status": "queued", "queue_position": service.request_queue.qsize()})
+async def _riassumi(l: Lavoro):
+    """Ricerca di prova all'avvio: nei log solo la struttura del risultato, mai i dati delle persone."""
+    while l.stato in ("in coda", "in corso"):
+        await asyncio.sleep(2)
+    x = l.risultato or {}
+    imm = x.get("immobili", [])
+    con = next((i["intestati"] for i in imm if i.get("intestati")), None) or [{}]
+    log.info("SELFTEST %s: errore=%s immobili=%d soggetti=%d colonne=%s intestati=%s colonne_intestati=%s avvisi=%s",
+             l.stato, l.errore, len(imm), len(x.get("soggetti", [])), list(imm[0]["dati"]) if imm else [],
+             [len(i["intestati"] or []) for i in imm][:10], list(con[0]), x.get("avvisi"))
 
-@app.post("/visura/soggetto")
-async def richiedi_ricerca_soggetto(request: SoggettoInput, service: VisuraService = Depends(get_visura_service)):
-    """Ricerca per soggetto; il risultato si legge con GET /visura/{request_id}"""
-    if request.tipo_soggetto == "PF" and not request.codice_fiscale and not request.cognome:
-        raise HTTPException(status_code=422, detail="Persona fisica: servono cognome (e nome) oppure codice fiscale")
-    if request.tipo_soggetto == "PNF" and not request.codice_fiscale and not request.denominazione:
-        raise HTTPException(status_code=422, detail="Persona giuridica: servono denominazione oppure codice fiscale")
-    return await _queue_ricerca(service, "soggetto", request.dict())
 
-@app.post("/visura/indirizzo")
-async def richiedi_ricerca_indirizzo(request: IndirizzoInput, service: VisuraService = Depends(get_visura_service)):
-    """Ricerca per indirizzo; il risultato si legge con GET /visura/{request_id}"""
-    return await _queue_ricerca(service, "indirizzo", request.dict())
+app = FastAPI(title="visura-api", lifespan=lifespan)
 
-@app.post("/visura/intestati")
-async def richiedi_intestati_immobile(
-    request: VisuraIntestatiInput,
-    service: VisuraService = Depends(get_visura_service)
-):
-    """Richiede gli intestati per un immobile specifico."""
-    try:
-        sezione = None if request.sezione == "_" else request.sezione
-        
-        request_id = f"intestati_{request.tipo_catasto}_{request.subalterno or 'none'}_{int(time.time() * 1000)}"
-        
-        intestati_request = VisuraIntestatiRequest(
-            request_id=request_id,
-            tipo_catasto=request.tipo_catasto,
-            provincia=request.provincia,
-            comune=request.comune,
-            foglio=request.foglio,
-            particella=request.particella,
-            subalterno=request.subalterno,
-            sezione=sezione
-        )
-        
-        await service.add_intestati_request(intestati_request)
-        
-        return JSONResponse({
-            "request_id": request_id,
-            "tipo_catasto": request.tipo_catasto,
-            "subalterno": request.subalterno,
-            "status": "queued",
-            "message": f"Richiesta intestati aggiunta alla coda per {request.comune} F.{request.foglio} P.{request.particella}",
-            "queue_position": service.request_queue.qsize()
-        })
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Errore nella richiesta intestati: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
-async def health_check(service: VisuraService = Depends(get_visura_service)):
-    """Controlla lo stato del servizio"""
-    return JSONResponse({
-        "status": "healthy",
-        "authenticated": service.browser_manager.authenticated,
-        "queue_size": service.request_queue.qsize()
-    })
+@app.post("/ricerche")
+async def nuova(corpo: Corpo):
+    r = corpo.ricerca
+    if isinstance(r, Soggetto):
+        if r.tipo_soggetto == "PF" and not (r.codice_fiscale or r.cognome):
+            raise HTTPException(422, "Scrivi cognome e nome, oppure il codice fiscale.")
+        if r.tipo_soggetto == "PNF" and not (r.codice_fiscale or r.denominazione):
+            raise HTTPException(422, "Scrivi la denominazione, oppure codice fiscale o partita IVA.")
+    if STATO["blocco"]:
+        raise HTTPException(503, STATO["blocco"])
+    if not (USERNAME and PASSWORD):
+        raise HTTPException(503, "Credenziali SISTER mancanti su visura-api (SISTER_USERNAME e SISTER_PASSWORD).")
+    l = Lavoro(r)
+    LAVORI[l.id] = l
+    await LAVORATORE.coda.put(l)
+    return l.json()
 
-@app.post("/shutdown")
-async def graceful_shutdown_endpoint(service: VisuraService = Depends(get_visura_service)):
-    """Effettua uno shutdown graceful del servizio"""
-    try:
-        logger.info("Shutdown graceful richiesto via API")
-        await service.graceful_shutdown()
-        return JSONResponse({
-            "status": "success",
-            "message": "Shutdown graceful completato"
-        })
-    except Exception as e:
-        logger.error(f"Errore durante shutdown graceful via API: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/sezioni/extract")
-async def extract_sezioni(
-    request: SezioniExtractionRequest,
-    service: VisuraService = Depends(get_visura_service)
-):
-    """
-    Estrae le sezioni territoriali d'Italia per il tipo catasto specificato.
-    ATTENZIONE: Questa operazione può richiedere diverse ore!
-    I dati vengono restituiti nella risposta.
-    """
-    try:
-        logger.info(f"Iniziando estrazione sezioni per tipo catasto: {request.tipo_catasto}, max province: {request.max_province}")
-        
-        if not service.browser_manager.authenticated or not service.browser_manager.auth_page:
-            raise HTTPException(status_code=503, detail="Servizio non autenticato")
-        
-        sezioni_data = await extract_all_sezioni(service.browser_manager.auth_page, request.tipo_catasto, request.max_province)
-        
-        if not sezioni_data:
-            return JSONResponse({
-                "status": "no_data",
-                "message": "Nessuna sezione estratta",
-                "count": 0
-            })
-        
-        logger.info(f"Estrazione sezioni completata: {len(sezioni_data)} totali")
-        
-        return JSONResponse({
-            "status": "success",
-            "message": f"Estrazione completata per tipo catasto {request.tipo_catasto}",
-            "total_extracted": len(sezioni_data),
-            "tipo_catasto": request.tipo_catasto,
-            "sezioni": sezioni_data
-        })
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Errore durante estrazione sezioni: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/ricerche/{id}")
+async def leggi(id: str):
+    l = LAVORI.get(id)
+    if not l:
+        raise HTTPException(404, "Ricerca sconosciuta: il servizio visure è stato riavviato, ripeti la ricerca.")
+    return l.json()
+
+
+@app.get("/stato")
+async def stato():
+    return {"ok": not STATO["blocco"] and bool(USERNAME and PASSWORD), "credenziali": bool(USERNAME and PASSWORD),
+            "sessione_aperta": STATO["sessione"], "in_coda": LAVORATORE.coda.qsize(), "blocco": STATO["blocco"],
+            "ultimo_errore": STATO["ultimo_errore"], "ultima_ricerca": STATO["ultima_ricerca"]}
+
+
+@app.get("/")
+async def radice():
+    return {"servizio": "visura-api", "stato": "/stato"}
