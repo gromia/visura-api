@@ -451,10 +451,6 @@ class Sessione:
                 raise SessionePersa("SISTER ha perso l'elenco degli immobili.")
         await radio.first.check()
         await self._invia("input[type=submit][name=intestati]")
-        if os.environ.get("VISURA_ESPLORA"):
-            st = await p.evaluate(JS_STRUTTURA)
-            st.pop("superficie", None) if not st.get("superficie") else None
-            log.info("ESPLORA intestati: tabelle=%s pulsanti=%s superficie=%s", st["tabelle"], st["pulsanti"], st.get("superficie"))
         if await p.locator("input[type=submit][name=intestati]").count():
             # ancora l'elenco: SISTER non ha gli intestati di questa unità e lo dice nel suo messaggio
             messaggio = await self._messaggio()
@@ -526,40 +522,8 @@ async def cerca_particella(s: Sessione, provincia: str, comune: str, foglio: str
         if not scelte:
             return {"immobili": [], "avvisi": [f"Il subalterno {subalterno} non c'è tra le {len(righe)} unità della particella."]}
         righe = scelte
-    if os.environ.get("VISURA_ESPLORA"):
-        await _esplora(s, righe[0], ricerca)
     return {"immobili": await _con_intestati(s, righe, catasto, ricerca, max_intestati),
             "avvisi": avviso_limite(len(righe), max_intestati)}
-
-
-JS_STRUTTURA = """
-() => ({
-  titolo: document.title,
-  tabelle: [...document.querySelectorAll('table')].map(t => [...t.querySelectorAll('th')].map(h => h.innerText.trim()).join('|')).filter(x => x),
-  pulsanti: [...document.querySelectorAll('input[type=submit], input[type=button], button')].map(b => (b.name || '') + '=' + (b.value || b.innerText || '').trim()),
-  superficie: (document.body.innerText.match(/.{0,60}uperfic.{0,90}/gi) || []).slice(0, 8),
-})
-"""
-
-
-async def _esplora(s: Sessione, riga: Riga, rifai):
-    """Solo con VISURA_ESPLORA: struttura delle pagine dell'unità (tabelle, pulsanti, righe con "superficie")
-    per capire dove SISTER mette un dato. Nei log niente nomi: solo intestazioni e dati dell'immobile."""
-    p = s.page
-    try:
-        log.info("ESPLORA elenco: %s consistenza=%r altri=%r", await p.evaluate(JS_STRUTTURA),
-                 riga.dati.get("Consistenza"), riga.dati.get("Altri Dati"))
-        for nome in ("visura", "dettaglio", "dati", "visuraImm"):
-            b = p.locator(f"input[type=submit][name={nome}]")
-            if await b.count() and riga.radio:
-                await p.locator(f"input[name='{riga.radio['name']}'][value='{riga.radio['value']}']").first.check()
-                await s.naviga(b.first)
-                log.info("ESPLORA dopo %s: %s", nome, await p.evaluate(JS_STRUTTURA))
-                await rifai()
-                break
-    except Exception as e:
-        log.warning("ESPLORA non riuscita: %s %s", type(e).__name__, str(e)[:200])
-        await rifai()
 
 
 def _sub(dati: dict) -> str:
