@@ -542,6 +542,15 @@ JS_STRUTTURA = """
 """
 
 
+JS_MODULO = """
+() => [...document.querySelectorAll('input, select')].filter(e => e.type !== 'hidden').map(e => {
+  const lab = (e.closest('tr, li, label, p, div') || e.parentElement).innerText.replace(/\\s+/g, ' ').trim().slice(0, 80);
+  if (e.tagName === 'SELECT') return e.name + ' select [' + [...e.options].map(o => o.value + ':' + o.text.trim()).join(', ').slice(0, 300) + ']';
+  return e.name + ' ' + e.type + '=' + e.value + (e.checked ? ' (scelto)' : '') + ' «' + lab + '»';
+}).slice(0, 40)
+"""
+
+
 async def _esplora(s: Sessione, riga: Riga, rifai):
     """Solo con VISURA_ESPLORA: struttura delle pagine dell'unità (tabelle, pulsanti, righe con "superficie")
     per capire dove SISTER mette un dato. Nei log niente nomi: solo intestazioni e dati dell'immobile."""
@@ -555,6 +564,20 @@ async def _esplora(s: Sessione, riga: Riga, rifai):
                 await p.locator(f"input[name='{riga.radio['name']}'][value='{riga.radio['value']}']").first.check()
                 await s.naviga(b.first)
                 log.info("ESPLORA dopo %s: %s", nome, await p.evaluate(JS_STRUTTURA))
+                log.info("ESPLORA modulo: %s", await p.evaluate(JS_MODULO))
+                inoltra = p.locator("input[type=submit][name=inoltra]")
+                if await inoltra.count():
+                    try:
+                        async with p.expect_download(timeout=20_000) as dl:
+                            await inoltra.first.click()
+                        d = await dl.value
+                        log.info("ESPLORA inoltra: scaricato %s", d.suggested_filename)
+                        dati = open(await d.path(), "rb").read()
+                        log.info("ESPLORA file: %d byte, inizio %r", len(dati), dati[:8])
+                    except PWTimeout:
+                        await p.wait_for_load_state("domcontentloaded")
+                        log.info("ESPLORA dopo inoltra: %s url=%s", await p.evaluate(JS_STRUTTURA), urlparse(p.url).path)
+                        log.info("ESPLORA modulo dopo inoltra: %s", await p.evaluate(JS_MODULO))
                 await rifai()
                 break
     except Exception as e:
